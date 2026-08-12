@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.dynamodb.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -83,6 +84,7 @@ public class GlobalSecondaryIndex {
      * Returns all sort key attribute names in key-schema order. For a composite sort key this
      * contains more than one element; ordering must consider all of them, not just the first.
      */
+    @JsonIgnore
     public List<String> getSortKeyNames() {
         return keySchema.stream()
                 .filter(k -> "RANGE".equals(k.getKeyType()))

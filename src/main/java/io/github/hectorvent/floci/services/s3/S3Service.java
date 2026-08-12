@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.s3;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
@@ -45,7 +46,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class S3Service implements Resettable {
+public class S3Service implements Resettable, AccountCloneable {
     private String ownerId() { return regionResolver != null ? regionResolver.getAccountId() : "000000000000"; }
     private static final String DEFAULT_OWNER_DISPLAY_NAME = "floci";
     private static final String AUTHENTICATED_USERS_GROUP_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
@@ -2811,6 +2812,66 @@ public class S3Service implements Resettable {
         } catch (IOException e) {
             LOG.errorv(e, "Failed to delete directory: {0}", dir);
         }
+    }
+
+    private void copyDirectory(Path source, Path target) {
+        if (!Files.exists(source)) return;
+        try (var walk = Files.walk(source)) {
+            walk.forEach(path -> {
+                try {
+                    Path dest = target.resolve(source.relativize(path));
+                    if (Files.isDirectory(path)) {
+                        Files.createDirectories(dest);
+                    } else {
+                        Files.createDirectories(dest.getParent());
+                        Files.copy(path, dest);
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to copy " + path + " to account-scoped layout", e);
+                }
+            });
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to walk directory for account clone: " + source, e);
+        }
+    }
+
+    // --- AccountCloneable ---
+    // bucketStore/objectStore are already cloned/cleared generically (they're plain
+    // AccountAwareStorageBackend fields under the "s3" service name). This handles what that
+    // can't: the object-byte bypass fields (memoryDataStore, on-disk files). No ARN rewrite is
+    // needed here, unlike DynamoDB/SQS/SNS — real S3 ARNs never include the account ID
+    // ("arn:aws:s3:::bucket"). multipartUploads/memoryMultipartStore are deliberately left alone:
+    // they're transient in-progress uploads with no account scoping at all today.
+
+    @Override
+    public String serviceName() {
+        return "s3";
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        if (inMemory) {
+            String sourcePrefix = sourceAccountId + "/";
+            for (Map.Entry<String, byte[]> entry : memoryDataStore.entrySet()) {
+                if (entry.getKey().startsWith(sourcePrefix)) {
+                    String rest = entry.getKey().substring(sourcePrefix.length());
+                    memoryDataStore.put(targetAccountId + "/" + rest, Arrays.copyOf(entry.getValue(), entry.getValue().length));
+                }
+            }
+            return;
+        }
+        copyDirectory(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(sourceAccountId),
+                dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(targetAccountId));
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        if (inMemory) {
+            String prefix = accountId + "/";
+            memoryDataStore.keySet().removeIf(k -> k.startsWith(prefix));
+            return;
+        }
+        deleteDirectory(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId));
     }
 
     private S3Object copyS3Object(String sourceBucket, String sourceKey,
