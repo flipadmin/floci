@@ -117,6 +117,42 @@ class AccountLifecycleControllerTest {
     }
 
     @Test
+    void cloneWorksForATableWithASortKeyAndAGsiWithASortKey() {
+        // The clone's Jackson copy must leave the derived getSortKeyNames() lists alone; they are
+        // only non-empty when the table or an index has a RANGE key.
+        String tableName = "clone-lifecycle-sort-key-table";
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .header("Authorization", auth("dynamodb", SOURCE_ACCOUNT))
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s",
+                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"},
+                                           {"AttributeName": "gsiSk", "AttributeType": "S"}],
+                 "GlobalSecondaryIndexes": [{"IndexName": "gsi1",
+                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "gsiSk", "KeyType": "RANGE"}],
+                     "Projection": {"ProjectionType": "ALL"},
+                     "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}}],
+                 "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}}
+                """.formatted(tableName))
+        .when().post("/").then().statusCode(200);
+
+        clone(TARGET_ACCOUNT, SOURCE_ACCOUNT, "dynamodb");
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeTable")
+            .header("Authorization", auth("dynamodb", TARGET_ACCOUNT))
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/").then()
+            .statusCode(200)
+            .body("Table.TableArn", containsString(":" + TARGET_ACCOUNT + ":"));
+    }
+
+    @Test
     void cloneRekeysDynamoDbBackupsUnderTheTargetAccountArn() {
         String tableName = "clone-lifecycle-backup-table";
         ddb(SOURCE_ACCOUNT, "CreateTable", simpleTableBody(tableName)).statusCode(200);
