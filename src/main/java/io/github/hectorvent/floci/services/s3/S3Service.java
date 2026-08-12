@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
@@ -101,7 +102,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 @ApplicationScoped
-public class S3Service implements Resettable, ResourceProvider {
+public class S3Service implements Resettable, ResourceProvider, AccountCloneable {
     private String ownerId() {
         if (regionResolver != null) {
             return regionResolver.getAccountId();
@@ -7418,6 +7419,85 @@ public class S3Service implements Resettable, ResourceProvider {
         } catch (IOException e) {
             LOG.errorv(e, "Failed to delete directory: {0}", dir);
         }
+    }
+
+    private void copyDirectory(Path source, Path target) {
+        if (!Files.exists(source)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(source)) {
+            walk.forEach(path -> {
+                try {
+                    Path dest = target.resolve(source.relativize(path));
+                    if (Files.isDirectory(path)) {
+                        Files.createDirectories(dest);
+                    } else {
+                        Files.createDirectories(dest.getParent());
+                        Files.copy(path, dest);
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to copy " + path + " to account-scoped layout", e);
+                }
+            });
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to walk directory for account clone: " + source, e);
+        }
+    }
+
+    // --- AccountCloneable ---
+    // The "s3" stores (buckets, objects, annotations, account Block Public Access) are already
+    // cloned/cleared generically. This handles what that can't: the object and annotation payload
+    // bytes held outside them (memoryDataStore/memoryAnnotationStore, or the account's directory on
+    // disk), and the account's in-progress multipart uploads. No ARN rewrite is needed here, unlike
+    // DynamoDB/SQS/SNS: real S3 bucket ARNs never include the account ID ("arn:<partition>:s3:::bucket").
+    // In-progress multipart uploads are transient, so a clone does not copy them.
+
+    @Override
+    public String serviceName() {
+        return "s3";
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        clearAccountPayloads(targetAccountId);
+        if (inMemory) {
+            copyAccountEntries(memoryDataStore, targetAccountId, sourceAccountId);
+            copyAccountEntries(memoryAnnotationStore, targetAccountId, sourceAccountId);
+            return;
+        }
+        copyDirectory(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(sourceAccountId),
+                dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(targetAccountId));
+    }
+
+    private static void copyAccountEntries(Map<String, byte[]> store, String targetAccountId, String sourceAccountId) {
+        String sourcePrefix = sourceAccountId + "/";
+        for (Map.Entry<String, byte[]> entry : store.entrySet()) {
+            if (entry.getKey().startsWith(sourcePrefix)) {
+                String rest = entry.getKey().substring(sourcePrefix.length());
+                store.put(targetAccountId + "/" + rest, Arrays.copyOf(entry.getValue(), entry.getValue().length));
+            }
+        }
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        for (MultipartUpload upload : List.copyOf(multipartUploads.values())) {
+            if (accountId.equals(upload.getOwnerAccountId())) {
+                withMultipartOperationLock(upload.getBucket(), upload.getUploadId(),
+                        () -> cleanupMultipart(upload.getUploadId()));
+            }
+        }
+        clearAccountPayloads(accountId);
+    }
+
+    private void clearAccountPayloads(String accountId) {
+        if (inMemory) {
+            String prefix = accountId + "/";
+            memoryDataStore.keySet().removeIf(k -> k.startsWith(prefix));
+            memoryAnnotationStore.keySet().removeIf(k -> k.startsWith(prefix));
+            return;
+        }
+        deleteDirectory(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId));
     }
 
     private S3Object copyS3Object(String sourceBucket, String sourceKey,

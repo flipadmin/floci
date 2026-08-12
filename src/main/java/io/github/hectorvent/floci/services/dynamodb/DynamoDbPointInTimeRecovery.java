@@ -54,17 +54,46 @@ final class DynamoDbPointInTimeRecovery {
                 store.get(key).ifPresent(change -> stored.put(defaultAccountId + "/" + key, change));
             }
         }
-        stored.forEach((key, change) -> changesByTable
+        changesByTable.putAll(group(stored));
+    }
+
+    private static Map<String, Changes> group(Map<String, PointInTimeChange> stored) {
+        Map<String, Changes> grouped = new HashMap<>();
+        stored.forEach((key, change) -> grouped
                 .computeIfAbsent(key.substring(0, key.lastIndexOf('#')), ignored -> new Changes())
                 .list.add(change));
-        for (Changes changes : changesByTable.values()) {
+        for (Changes changes : grouped.values()) {
             changes.list.sort(Comparator.comparingLong(PointInTimeChange::getSequence));
             changes.nextSequence = changes.list.getLast().getSequence() + 1;
         }
+        return grouped;
     }
 
     void clear() {
         changesByTable.clear();
+    }
+
+    /**
+     * Replaces the account's history with what the store holds for it. Call after an account
+     * clone or clear rewrote the account's stored changes directly.
+     */
+    void reloadAccount(String accountId) {
+        String prefix = accountId + "/";
+        for (Map.Entry<String, Changes> entry : changesByTable.entrySet()) {
+            if (entry.getKey().startsWith(prefix) && changesByTable.remove(entry.getKey(), entry.getValue())) {
+                synchronized (entry.getValue()) {
+                    entry.getValue().dropped = true;
+                }
+            }
+        }
+        if (!(store instanceof AccountAwareStorageBackend<PointInTimeChange> aware)) {
+            return;
+        }
+        Map<String, PointInTimeChange> stored = new HashMap<>();
+        for (String key : aware.keysForAccount(accountId)) {
+            aware.getForAccount(accountId, key).ifPresent(change -> stored.put(prefix + key, change));
+        }
+        changesByTable.putAll(group(stored));
     }
 
     /** Call after point-in-time recovery of the table is turned off, so no writer records again. */

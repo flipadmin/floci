@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Digests;
@@ -84,7 +85,7 @@ import static io.github.hectorvent.floci.services.dynamodb.DynamoDbTimestamps.ep
 import static io.github.hectorvent.floci.services.dynamodb.DynamoDbTimestamps.instantOf;
 
 @ApplicationScoped
-public class DynamoDbService {
+public class DynamoDbService implements AccountCloneable {
 
     private static final String LOCAL_REPLICA_UPDATE_ERROR =
             "Cannot add, delete, or update the local region through ReplicaUpdates. "
@@ -4247,6 +4248,92 @@ public class DynamoDbService {
         return itemLocks
                 .computeIfAbsent(scopedKey, k -> new ConcurrentHashMap<>())
                 .computeIfAbsent(itemKey, k -> new ReentrantLock());
+    }
+
+    // --- AccountCloneable ---
+
+    @Override
+    public String serviceName() {
+        return "dynamodb";
+    }
+
+    /**
+     * The "dynamodb" stores (tables, items, exports, imports, backups, point-in-time changes) are
+     * already cloned generically by the time this runs. This handles what that can't: itemsByTable,
+     * the bypass field holding the live item data; the in-memory point-in-time history built from
+     * the change store; and the account ID baked into each cloned table's tableArn/indexArn and each
+     * cloned backup's ARN, which is also the backup's storage key. Locks and the TransactWriteItems
+     * idempotency cache are intentionally not cloned: they are transient and start fresh for the
+     * target account.
+     */
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        String targetPrefix = targetAccountId + "/";
+        itemsByTable.keySet().removeIf(k -> k.startsWith(targetPrefix));
+        String sourcePrefix = sourceAccountId + "/";
+        for (Map.Entry<String, ConcurrentSkipListMap<String, JsonNode>> entry : itemsByTable.entrySet()) {
+            if (!entry.getKey().startsWith(sourcePrefix)) {
+                continue;
+            }
+            String rawKey = entry.getKey().substring(sourcePrefix.length());
+            ConcurrentSkipListMap<String, JsonNode> copy = new ConcurrentSkipListMap<>();
+            entry.getValue().forEach((itemKey, item) -> copy.put(itemKey, item.deepCopy()));
+            itemsByTable.put(targetAccountId + "/" + rawKey, copy);
+        }
+
+        if (tableStore instanceof AccountAwareStorageBackend<TableDefinition> aware) {
+            for (String rawKey : aware.keysForAccount(targetAccountId)) {
+                aware.getForAccount(targetAccountId, rawKey).ifPresent(table -> {
+                    rewriteTableArn(table, targetAccountId, rawKey.substring(0, rawKey.indexOf("::")));
+                    aware.putForAccount(targetAccountId, rawKey, table);
+                });
+            }
+        }
+
+        if (backupStore instanceof AccountAwareStorageBackend<TableBackup> aware) {
+            for (String backupArn : aware.keysForAccount(targetAccountId)) {
+                aware.getForAccount(targetAccountId, backupArn).ifPresent(backup -> {
+                    AwsArnUtils.Arn arn = AwsArnUtils.parse(backupArn);
+                    String targetArn = new AwsArnUtils.Arn(arn.partition(), arn.service(), arn.region(),
+                            targetAccountId, arn.resource()).toString();
+                    backup.setBackupArn(targetArn);
+                    if (backup.getTable() != null) {
+                        rewriteTableArn(backup.getTable(), targetAccountId, arn.region());
+                    }
+                    aware.deleteForAccount(targetAccountId, backupArn);
+                    aware.putForAccount(targetAccountId, targetArn, backup);
+                });
+            }
+        }
+
+        pointInTimeRecovery.reloadAccount(targetAccountId);
+    }
+
+    private void rewriteTableArn(TableDefinition table, String accountId, String region) {
+        String newTableArn = AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + table.getTableName()).toString();
+        table.setTableArn(newTableArn);
+        if (table.getGlobalSecondaryIndexes() != null) {
+            table.getGlobalSecondaryIndexes().forEach(gsi -> gsi.setIndexArn(newTableArn + "/index/" + gsi.getIndexName()));
+        }
+        if (table.getLocalSecondaryIndexes() != null) {
+            table.getLocalSecondaryIndexes().forEach(lsi -> lsi.setIndexArn(newTableArn + "/index/" + lsi.getIndexName()));
+        }
+    }
+
+    /**
+     * The "dynamodb" stores are already cleared generically by the time this runs; this handles
+     * the itemsByTable/itemLocks bypass fields, the in-memory point-in-time history, and the
+     * idempotency cache, whose key format ("accountId::region::token") differs from the
+     * "accountId/..." scheme used elsewhere.
+     */
+    @Override
+    public void clearAccountData(String accountId) {
+        String prefix = accountId + "/";
+        itemsByTable.keySet().removeIf(k -> k.startsWith(prefix));
+        itemLocks.keySet().removeIf(k -> k.startsWith(prefix));
+        String idempotencyPrefix = accountId + "::";
+        txIdempotency.keySet().removeIf(k -> k.startsWith(idempotencyPrefix));
+        pointInTimeRecovery.reloadAccount(accountId);
     }
 
     private void withItemLock(String storageKey, String itemKey, Runnable body) {
