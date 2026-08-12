@@ -165,6 +165,44 @@ other service, but real S3 bucket names are globally unique. Set
 partition, so a bucket created in one account is visible cross-account — needed when a workload writes a
 bucket in one account and reads it from another (see [S3](../services/s3.md#global-bucket-namespace)).
 
+## Account Clone & Clear (Test Isolation)
+
+Beyond preventing cross-account collisions, Floci can copy one account's data into another, or wipe an account clean, on demand. This is aimed at test suites that want a fresh, isolated account per test case — cloned from a shared baseline instead of provisioning resources from scratch every time — then discarded when the test finishes.
+
+This is an admin operation, not part of any AWS API emulation, so it lives on Floci's own `/_floci` (or `/_localstack`) prefix rather than a service endpoint:
+
+```
+POST /_floci/accounts/{targetAccountId}/clone
+{ "source": "111111111111", "services": ["dynamodb", "s3"] }
+
+POST /_floci/accounts/{targetAccountId}/clear
+{ "services": ["dynamodb", "s3"] }
+```
+
+- `services` is always required and explicit for both endpoints — there is no `"all"` shortcut, so a call only ever touches the services it names. An unknown or unsupported service name fails the whole call before anything is touched, never a partial clone/clear.
+- `clone` replaces the target's data for each requested service outright, not a merge — calling `clone` again on the same target simply resets it to match the source. Cloning is optimized for speed rather than mid-flight consistency: the source account is expected to stay frozen and the target unwritten for the duration of the call.
+- `clear` on a service the account has no data in is a no-op.
+
+!!! note "Supported services"
+    Currently: `dynamodb`, `s3`, `sqs`, `sns`, `ssm`. Every service that keeps its state entirely behind `StorageFactory` gets clone/clear for free; a handful of services still keep some state outside that layer and aren't wired up yet.
+
+Example: give each parallel test worker its own throwaway account cloned from a shared baseline, then wipe it when the test finishes:
+
+```bash
+BASELINE=111111111111
+WORKER=$(uuidgen | tr -dc '0-9' | cut -c1-12)   # any fresh 12-digit id
+
+curl -X POST http://localhost:4566/_floci/accounts/$WORKER/clone \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\": \"$BASELINE\", \"services\": [\"dynamodb\", \"s3\", \"sqs\", \"sns\", \"ssm\"]}"
+
+# ... run the test against $WORKER ...
+
+curl -X POST http://localhost:4566/_floci/accounts/$WORKER/clear \
+  -H 'Content-Type: application/json' \
+  -d '{"services": ["dynamodb", "s3", "sqs", "sns", "ssm"]}'
+```
+
 ## Signature Validation
 
 Floci does not currently perform general SigV4 validation for `Authorization` headers. Only the access key ID matters for account resolution, so the secret access key can be any non-empty string.
