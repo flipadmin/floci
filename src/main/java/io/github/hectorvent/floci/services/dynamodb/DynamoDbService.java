@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.dynamodb;
 
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -50,7 +51,7 @@ import java.util.function.Supplier;
 import java.util.zip.GZIPOutputStream;
 
 @ApplicationScoped
-public class DynamoDbService {
+public class DynamoDbService implements AccountCloneable {
 
     private static final Logger LOG = Logger.getLogger(DynamoDbService.class);
 
@@ -2326,6 +2327,70 @@ public class DynamoDbService {
         return itemLocks
                 .computeIfAbsent(scopedItemsKey(storageKey), k -> new ConcurrentHashMap<>())
                 .computeIfAbsent(itemKey, k -> new ReentrantLock());
+    }
+
+    // --- AccountCloneable ---
+
+    @Override
+    public String serviceName() {
+        return "dynamodb";
+    }
+
+    /**
+     * tableStore/itemStore/exportStore are already cloned generically (they're plain
+     * AccountAwareStorageBackend fields under the "dynamodb" service name) by the time this runs.
+     * This handles what that can't: itemsByTable, the bypass field holding the live item data, and
+     * the tableArn/indexArn strings baked into each cloned TableDefinition, which still point at
+     * sourceAccountId until rewritten here. Locks and the TransactWriteItems idempotency cache are
+     * intentionally not cloned — they're transient and start fresh for the target account.
+     */
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        String sourcePrefix = sourceAccountId + "/";
+        for (Map.Entry<String, ConcurrentSkipListMap<String, JsonNode>> entry : itemsByTable.entrySet()) {
+            if (!entry.getKey().startsWith(sourcePrefix)) {
+                continue;
+            }
+            String rawKey = entry.getKey().substring(sourcePrefix.length());
+            ConcurrentSkipListMap<String, JsonNode> copy = new ConcurrentSkipListMap<>();
+            entry.getValue().forEach((itemKey, item) -> copy.put(itemKey, item.deepCopy()));
+            itemsByTable.put(targetAccountId + "/" + rawKey, copy);
+        }
+
+        if (tableStore instanceof AccountAwareStorageBackend<TableDefinition> aware) {
+            for (String rawKey : aware.keysForAccount(targetAccountId)) {
+                aware.getForAccount(targetAccountId, rawKey).ifPresent(table -> {
+                    rewriteTableArn(table, targetAccountId, rawKey);
+                    aware.putForAccount(targetAccountId, rawKey, table);
+                });
+            }
+        }
+    }
+
+    private void rewriteTableArn(TableDefinition table, String accountId, String rawKey) {
+        String region = rawKey.substring(0, rawKey.indexOf("::"));
+        String newTableArn = AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + table.getTableName()).toString();
+        table.setTableArn(newTableArn);
+        if (table.getGlobalSecondaryIndexes() != null) {
+            table.getGlobalSecondaryIndexes().forEach(gsi -> gsi.setIndexArn(newTableArn + "/index/" + gsi.getIndexName()));
+        }
+        if (table.getLocalSecondaryIndexes() != null) {
+            table.getLocalSecondaryIndexes().forEach(lsi -> lsi.setIndexArn(newTableArn + "/index/" + lsi.getIndexName()));
+        }
+    }
+
+    /**
+     * tableStore/itemStore/exportStore are already cleared generically by the time this runs;
+     * this handles the itemsByTable/itemLocks bypass fields and the idempotency cache, whose key
+     * format ("accountId::region::token") differs from the "accountId/..." scheme used elsewhere.
+     */
+    @Override
+    public void clearAccountData(String accountId) {
+        String prefix = accountId + "/";
+        itemsByTable.keySet().removeIf(k -> k.startsWith(prefix));
+        itemLocks.keySet().removeIf(k -> k.startsWith(prefix));
+        String idempotencyPrefix = accountId + "::";
+        txIdempotency.keySet().removeIf(k -> k.startsWith(idempotencyPrefix));
     }
 
     private void withItemLock(String storageKey, String itemKey, Runnable body) {

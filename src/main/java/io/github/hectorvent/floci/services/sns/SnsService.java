@@ -1,10 +1,12 @@
 package io.github.hectorvent.floci.services.sns;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
@@ -51,7 +53,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 @ApplicationScoped
-public class SnsService implements Resettable {
+public class SnsService implements Resettable, AccountCloneable {
 
     private static final Logger LOG = Logger.getLogger(SnsService.class);
     private static final Duration FIFO_DEDUP_WINDOW = Duration.ofMinutes(5);
@@ -1522,6 +1524,95 @@ public class SnsService implements Resettable {
 
     private static String subKey(String region, String subscriptionArn) {
         return "sub::" + region + "::" + subscriptionArn;
+    }
+
+    // --- AccountCloneable ---
+    // topicStore/subscriptionStore/platformAppStore/platformEndpointStore/smsStore are plain
+    // AccountAwareStorageBackend fields under the "sns" service name, but — like SQS — a generic
+    // byte-level clone isn't correct on its own: every key here embeds the resource's own ARN,
+    // which bakes sourceAccountId in, so a shallow copy would leave the target account owning
+    // topics/subscriptions/etc. whose own ARN (and storage key) still points at the source
+    // account. This rewrites the account segment of each ARN via AwsArnUtils and rebuilds the key
+    // under the target account. smsStore (historical sent-SMS log, not an addressable resource)
+    // and fifoDeduplicationCache (a 5-minute transient window, rebuilt as messages are published)
+    // are left to the generic pass / cleared but not cloned.
+
+    @Override
+    public String serviceName() {
+        return "sns";
+    }
+
+    private static String regionFromCompositeKey(String key) {
+        String[] parts = key.split("::", 3);
+        return parts.length > 1 ? parts[1] : "";
+    }
+
+    private static String rewriteAccountInArn(String arn, String targetAccountId) {
+        if (arn == null) {
+            return null;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        return new AwsArnUtils.Arn(parsed.partition(), parsed.service(), parsed.region(), targetAccountId, parsed.resource()).toString();
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        clearAccountData(targetAccountId);
+
+        if (topicStore instanceof AccountAwareStorageBackend<Topic> awareTopics) {
+            for (String sourceKey : awareTopics.keysForAccount(sourceAccountId)) {
+                awareTopics.getForAccount(sourceAccountId, sourceKey).ifPresent(topic -> {
+                    String newArn = rewriteAccountInArn(topic.getTopicArn(), targetAccountId);
+                    Topic copy = objectMapper.convertValue(topic, Topic.class);
+                    copy.setTopicArn(newArn);
+                    awareTopics.putForAccount(targetAccountId, topicKey(regionFromCompositeKey(sourceKey), newArn), copy);
+                });
+            }
+        }
+        if (subscriptionStore instanceof AccountAwareStorageBackend<Subscription> awareSubs) {
+            for (String sourceKey : awareSubs.keysForAccount(sourceAccountId)) {
+                awareSubs.getForAccount(sourceAccountId, sourceKey).ifPresent(sub -> {
+                    String newSubArn = rewriteAccountInArn(sub.getSubscriptionArn(), targetAccountId);
+                    Subscription copy = objectMapper.convertValue(sub, Subscription.class);
+                    copy.setSubscriptionArn(newSubArn);
+                    copy.setTopicArn(rewriteAccountInArn(sub.getTopicArn(), targetAccountId));
+                    copy.setAccountId(targetAccountId);
+                    copy.setOwner(targetAccountId);
+                    awareSubs.putForAccount(targetAccountId, subKey(regionFromCompositeKey(sourceKey), newSubArn), copy);
+                });
+            }
+        }
+        if (platformAppStore instanceof AccountAwareStorageBackend<PlatformApplication> awareApps) {
+            for (String sourceKey : awareApps.keysForAccount(sourceAccountId)) {
+                awareApps.getForAccount(sourceAccountId, sourceKey).ifPresent(app -> {
+                    String newArn = rewriteAccountInArn(app.getArn(), targetAccountId);
+                    PlatformApplication copy = objectMapper.convertValue(app, PlatformApplication.class);
+                    copy.setArn(newArn);
+                    awareApps.putForAccount(targetAccountId, platformAppKey(regionFromCompositeKey(sourceKey), newArn), copy);
+                });
+            }
+        }
+        if (platformEndpointStore instanceof AccountAwareStorageBackend<PlatformEndpoint> awareEndpoints) {
+            for (String sourceKey : awareEndpoints.keysForAccount(sourceAccountId)) {
+                awareEndpoints.getForAccount(sourceAccountId, sourceKey).ifPresent(ep -> {
+                    String newArn = rewriteAccountInArn(ep.getArn(), targetAccountId);
+                    PlatformEndpoint copy = objectMapper.convertValue(ep, PlatformEndpoint.class);
+                    copy.setArn(newArn);
+                    copy.setPlatformApplicationArn(rewriteAccountInArn(ep.getPlatformApplicationArn(), targetAccountId));
+                    awareEndpoints.putForAccount(targetAccountId, endpointKey(regionFromCompositeKey(sourceKey), newArn), copy);
+                });
+            }
+        }
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        if (topicStore instanceof AccountAwareStorageBackend<Topic> a) a.clearForAccount(accountId);
+        if (subscriptionStore instanceof AccountAwareStorageBackend<Subscription> a) a.clearForAccount(accountId);
+        if (platformAppStore instanceof AccountAwareStorageBackend<PlatformApplication> a) a.clearForAccount(accountId);
+        if (platformEndpointStore instanceof AccountAwareStorageBackend<PlatformEndpoint> a) a.clearForAccount(accountId);
+        if (smsStore instanceof AccountAwareStorageBackend<SentSms> a) a.clearForAccount(accountId);
+        fifoDeduplicationCache.keySet().removeIf(k -> k.contains(":" + accountId + ":"));
     }
 
     /** All SMS messages published since last clear. Used by SnsInspectionController. */
