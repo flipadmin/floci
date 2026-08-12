@@ -110,6 +110,46 @@ class AccountLifecycleControllerTest {
     }
 
     @Test
+    void cloneWorksForATableWithASortKeyAndAGsiWithASortKey() {
+        // Regression test: TableDefinition/GlobalSecondaryIndex#getSortKeyNames() is a computed
+        // property (derived from keySchema, no backing field or setter) returning an immutable
+        // Stream#toList() list. The generic clone's Jackson round-trip serialized it like any
+        // other property, then tried to populate that immutable list back on deserialization —
+        // UnsupportedOperationException, surfaced to the caller as a 400. Only reproduces with a
+        // RANGE key present (HASH-only tables have an empty, harmless sortKeyNames list).
+        String tableName = "clone-lifecycle-sort-key-table";
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .header("Authorization", auth("dynamodb", SOURCE_ACCOUNT))
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s",
+                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}],
+                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}, {"AttributeName": "sk", "AttributeType": "S"},
+                                           {"AttributeName": "gsiSk", "AttributeType": "S"}],
+                 "GlobalSecondaryIndexes": [{"IndexName": "gsi1",
+                     "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "gsiSk", "KeyType": "RANGE"}],
+                     "Projection": {"ProjectionType": "ALL"},
+                     "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}}],
+                 "ProvisionedThroughput": {"ReadCapacityUnits": 5, "WriteCapacityUnits": 5}}
+                """.formatted(tableName))
+        .when().post("/").then().statusCode(200);
+
+        clone(TARGET_ACCOUNT, SOURCE_ACCOUNT, "dynamodb");
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeTable")
+            .header("Authorization", auth("dynamodb", TARGET_ACCOUNT))
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"TableName": "%s"}
+                """.formatted(tableName))
+        .when().post("/").then()
+            .statusCode(200)
+            .body("Table.TableArn", containsString(":" + TARGET_ACCOUNT + ":"));
+    }
+
+    @Test
     void cloneCopiesS3ObjectBytes() {
         String bucket = "clone-lifecycle-bucket";
         given().header("Authorization", auth("s3", SOURCE_ACCOUNT))
