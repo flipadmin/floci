@@ -165,6 +165,53 @@ other service, but real S3 bucket names are globally unique. Set
 partition, so a bucket created in one account is visible cross-account — needed when a workload writes a
 bucket in one account and reads it from another (see [S3](../services/s3.md#global-bucket-namespace)).
 
+## Account Clone & Clear (Test Isolation)
+
+Beyond preventing cross-account collisions, Floci can copy one account's data into another, or wipe an account clean, on demand. This is aimed at test suites that want a fresh, isolated account per test case, cloned from a shared baseline instead of provisioning resources from scratch every time, and then discarded when the test finishes.
+
+This is an admin operation, not part of any AWS API emulation, so it lives on Floci's own `/_floci` (or `/_localstack`) prefix rather than a service endpoint:
+
+```
+POST /_floci/accounts/{targetAccountId}/clone
+{ "source": "111111111111", "services": ["dynamodb", "s3"] }
+
+POST /_floci/accounts/{targetAccountId}/clear
+{ "services": ["dynamodb", "s3"] }
+```
+
+- `services` is always required and explicit for both endpoints: there is no `"all"` shortcut, so a call only ever touches the services it names. An unknown or unsupported service name fails the whole call before anything is touched, never a partial clone/clear.
+- `clone` replaces the target's data for each requested service outright, not a merge: calling `clone` again on the same target simply resets it to match the source. Cloning is optimized for speed rather than mid-flight consistency: the source account is expected to stay frozen and the target unwritten for the duration of the call.
+- `clear` on a service the account has no data in is a no-op.
+
+!!! note "Supported services"
+    Currently: `dynamodb`, `s3`, `sqs`, `sns`, `ssm`. Every service that keeps its state entirely behind `StorageFactory` gets clone/clear for free; a handful of services still keep some state outside that layer and aren't wired up yet.
+
+What a clone rewrites and what it leaves alone:
+
+- Identifiers that embed the account ID are rewritten to the target account: DynamoDB table, index and backup ARNs, SQS queue URLs and ARNs, SNS topic, subscription and platform ARNs, and SSM parameter ARNs.
+- DynamoDB items, backups and point-in-time history, S3 object and annotation bytes, SQS messages and FIFO deduplication windows are copied.
+- In-progress S3 multipart uploads are not copied; `clear` aborts the account's uploads.
+- References from one resource to another keep pointing at the source account: an SQS redrive policy's dead-letter queue ARN, a queue or topic policy, an SNS subscription endpoint, a DynamoDB stream ARN and the stream records behind it.
+- SSM service settings are stored under a key that names the account, so the target account reads its defaults instead of the source's customized settings. SSM documents keep the source account as their owner.
+- DynamoDB clone/clear covers the default `native` backend only; with `floci.services.dynamodb.backend: local` the data lives in DynamoDB Local and is not copied.
+
+Example: give each parallel test worker its own throwaway account cloned from a shared baseline, then wipe it when the test finishes:
+
+```bash
+BASELINE=111111111111
+WORKER=$(uuidgen | tr -dc '0-9' | cut -c1-12)   # any fresh 12-digit id
+
+curl -X POST http://localhost:4566/_floci/accounts/$WORKER/clone \
+  -H 'Content-Type: application/json' \
+  -d "{\"source\": \"$BASELINE\", \"services\": [\"dynamodb\", \"s3\", \"sqs\", \"sns\", \"ssm\"]}"
+
+# ... run the test against $WORKER ...
+
+curl -X POST http://localhost:4566/_floci/accounts/$WORKER/clear \
+  -H 'Content-Type: application/json' \
+  -d '{"services": ["dynamodb", "s3", "sqs", "sns", "ssm"]}'
+```
+
 ## Signature Validation
 
 By default Floci does not verify SigV4 signatures. Only the access key ID matters for account resolution, so the secret access key can be any non-empty string.

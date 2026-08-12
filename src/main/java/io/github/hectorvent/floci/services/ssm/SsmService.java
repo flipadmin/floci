@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.DeadlineCharSequence;
@@ -15,6 +16,7 @@ import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -45,7 +47,7 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 @ApplicationScoped
-public class SsmService implements ResourceProvider {
+public class SsmService implements ResourceProvider, AccountCloneable {
 
     private static final Logger LOG = Logger.getLogger(SsmService.class);
 
@@ -1525,6 +1527,38 @@ public class SsmService implements ResourceProvider {
 
     private static String regionKey(String region, String name) {
         return region + "::" + name;
+    }
+
+    // --- AccountCloneable ---
+    // parameterStore/historyStore are plain AccountAwareStorageBackend fields under the "ssm"
+    // service name, and, unlike SQS/SNS, the storage key here (region::name) never embeds the
+    // account ID, only the Parameter's own `arn` field does. So the generic storage-level clone
+    // already leaves each cloned parameter reachable at the right key; this only has to fix up
+    // the stale arn left pointing at the source account. No bypass fields exist, so clear needs
+    // no extra work beyond the generic pass.
+
+    @Override
+    public String serviceName() {
+        return "ssm";
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        if (!(parameterStore instanceof AccountAwareStorageBackend<Parameter> aware)) {
+            return;
+        }
+        for (String rawKey : aware.keysForAccount(targetAccountId)) {
+            aware.getForAccount(targetAccountId, rawKey).ifPresent(parameter -> {
+                String region = rawKey.substring(0, rawKey.indexOf("::"));
+                parameter.setArn(AwsArnUtils.Arn.of("ssm", region, targetAccountId, parameterResource(parameter.getName())).toString());
+                aware.putForAccount(targetAccountId, rawKey, parameter);
+            });
+        }
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        // No bypass fields: the generic storage-level clear already covers parameterStore/historyStore.
     }
 
     private void addHistory(String storageKey, Parameter parameter) {

@@ -43,6 +43,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     private final StorageBackend<String, V> delegate;
     private final Instance<RequestContext> requestContextInstance;
     private final String defaultAccountId;
+    private final Function<V, V> deepCopy;
 
     // Accounts that own keys here, so findAnyAccountEntry does one get per account instead of a scan.
     // Tracking starts on the first cross-account lookup, so other stores pay one volatile read per write.
@@ -54,9 +55,23 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     public AccountAwareStorageBackend(StorageBackend<String, V> delegate,
                                       Instance<RequestContext> requestContextInstance,
                                       String defaultAccountId) {
+        this(delegate, requestContextInstance, defaultAccountId, Function.identity());
+    }
+
+    /**
+     * @param deepCopy produces an independent copy of a value for {@link #cloneAccount}, so the
+     *                 cloned account's data can never be mutated through the source account's
+     *                 reference (or vice versa). Callers that never clone accounts may pass
+     *                 {@link Function#identity()}.
+     */
+    public AccountAwareStorageBackend(StorageBackend<String, V> delegate,
+                                      Instance<RequestContext> requestContextInstance,
+                                      String defaultAccountId,
+                                      Function<V, V> deepCopy) {
         this.delegate = delegate;
         this.requestContextInstance = requestContextInstance;
         this.defaultAccountId = defaultAccountId;
+        this.deepCopy = deepCopy;
     }
 
     /**
@@ -521,6 +536,25 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
             if (slash > 0) {
                 ownerAccounts.add(rawKey.substring(0, slash));
             }
+        }
+    }
+
+    /**
+     * Replaces every entry {@code targetAccountId} owns with a deep copy of {@code sourceAccountId}'s
+     * corresponding entry. Existing target entries with no counterpart in the source are removed, so
+     * the target ends up an exact copy of the source rather than a merge.
+     */
+    public void cloneAccount(String targetAccountId, String sourceAccountId) {
+        clearForAccount(targetAccountId);
+        for (String key : keysForAccount(sourceAccountId)) {
+            getForAccount(sourceAccountId, key).ifPresent(v -> putForAccount(targetAccountId, key, deepCopy.apply(v)));
+        }
+    }
+
+    /** Deletes every entry {@code accountId} owns. */
+    public void clearForAccount(String accountId) {
+        for (String key : keysForAccount(accountId)) {
+            deleteForAccount(accountId, key);
         }
     }
 
