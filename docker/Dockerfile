@@ -7,7 +7,11 @@ RUN apt-get update && apt-get install -y maven && rm -rf /var/lib/apt/lists/*
 COPY pom.xml .
 RUN mvn dependency:go-offline -q
 
+# The Cedar sidecar is added as a test source by build-helper in pom.xml, and `-DskipTests`
+# still compiles tests, so the package step needs these sources present even though nothing
+# from them is copied into the runtime stage.
 COPY src/ src/
+COPY sidecars/ sidecars/
 RUN mvn clean package -DskipTests -q
 
 # Stage 2: Runtime
