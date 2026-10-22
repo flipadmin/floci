@@ -539,6 +539,48 @@ class AccountLifecycleControllerTest {
     }
 
     @Test
+    void cloneRejectsAStorageBackedServiceWithoutItsOwnCloneStepAtomically() {
+        // IAM keeps its state behind StorageFactory; using it first makes sure its stores exist.
+        given()
+            .header("Authorization", auth("iam", SOURCE_ACCOUNT))
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListUsers")
+        .when().post("/").then().statusCode(200);
+        given()
+            .header("X-Amz-Target", "AmazonSSM.PutParameter")
+            .header("Authorization", auth("ssm", SOURCE_ACCOUNT))
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {"Name": "/clone-lifecycle/rejected-with-iam", "Value": "v", "Type": "String"}
+                """)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"source": "%s", "services": ["ssm", "iam"]}
+                """.formatted(SOURCE_ACCOUNT))
+        .when().post("/_floci/accounts/" + TARGET_ACCOUNT + "/clone")
+        .then().statusCode(400);
+        given()
+            .contentType("application/json")
+            .body("""
+                {"services": ["iam"]}
+                """)
+        .when().post("/_floci/accounts/" + TARGET_ACCOUNT + "/clear")
+        .then().statusCode(400);
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.GetParameter")
+            .header("Authorization", auth("ssm", TARGET_ACCOUNT))
+            .contentType(SSM_CONTENT_TYPE)
+            .body("""
+                {"Name": "/clone-lifecycle/rejected-with-iam"}
+                """)
+        .when().post("/").then().statusCode(400);
+    }
+
+    @Test
     void cloneRejectsAMissingSource() {
         given()
             .contentType("application/json")

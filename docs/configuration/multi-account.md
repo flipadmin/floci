@@ -186,7 +186,7 @@ POST /_floci/accounts/{targetAccountId}/clear
 - `clear` on a service the account has no data in is a no-op.
 
 !!! note "Supported services"
-    Currently: `dynamodb`, `s3`, `sqs`, `sns`, `ssm`. Every service that keeps its state entirely behind `StorageFactory` gets clone/clear for free; a handful of services still keep some state outside that layer and aren't wired up yet.
+    Currently: `dynamodb`, `s3`, `sqs`, `sns`, `ssm`. Any other service name is refused, even when the service keeps its state behind `StorageFactory`: a stored value can still name the source account (an IAM access key, a Lambda function ARN), so a plain copy is not a working clone. A service is supported once it implements its own clone/clear step.
 
 What a clone rewrites and what it leaves alone:
 

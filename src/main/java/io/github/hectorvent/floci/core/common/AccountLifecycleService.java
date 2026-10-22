@@ -10,14 +10,18 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Orchestrates account-scoped clone/clear across every service that supports it: the generic
- * {@code AccountAwareStorageBackend} layer via {@link StorageFactory} for services with no bypass
- * state, plus each {@link AccountCloneable} for services that need more (a bypass field outside
+ * Orchestrates account-scoped clone/clear for the services that implement {@link AccountCloneable}:
+ * the generic {@code AccountAwareStorageBackend} copy via {@link StorageFactory} for the service's
+ * stores, then the service's own step for what that copy can't handle (a bypass field outside
  * that layer, or an account-derived identifier baked into already-cloned data).
  *
+ * <p>Only those services are supported. A service whose stores merely live behind
+ * {@code StorageFactory} is not: its stored values may still name the source account, so a
+ * generic copy alone would leave it inconsistent.
+ *
  * <p>Both operations always take an explicit list of service names, with no "all" default,
- * and reject the whole call if any requested name isn't registered by either mechanism, so a typo
- * or an unsupported service never results in a silently partial clone/clear.
+ * and reject the whole call if any requested name is not supported, so a typo or an unsupported
+ * service never results in a silently partial clone/clear.
  */
 @ApplicationScoped
 public class AccountLifecycleService {
@@ -31,8 +35,10 @@ public class AccountLifecycleService {
         this.accountCloneables = accountCloneables;
     }
 
+    // Asking each bean for its name also instantiates it, so its stores are registered with the
+    // StorageFactory before the generic copy runs.
     public Set<String> knownServiceNames() {
-        Set<String> names = new LinkedHashSet<>(storageFactory.knownServiceNames());
+        Set<String> names = new LinkedHashSet<>();
         for (AccountCloneable cloneable : accountCloneables) {
             names.add(cloneable.serviceName());
         }
