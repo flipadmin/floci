@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
+import io.github.hectorvent.floci.core.common.SignedMarkers;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
@@ -35,6 +36,7 @@ import java.security.*;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 import static io.github.hectorvent.floci.services.kms.model.KmsMessageType.RAW;
@@ -675,6 +677,66 @@ public class KmsService implements ResourceProvider {
             result.put("NextMarker", nextMarker);
         }
         return result;
+    }
+
+    public record Page<T>(List<T> items, String nextMarker) {
+        public boolean truncated() {
+            return nextMarker != null;
+        }
+    }
+
+    // LimitType in the model is [1..1000]; the ListKeys docs allow up to 1000, ListAliases up to 100.
+    static final int MAX_LIST_KEYS_LIMIT = 1000;
+    static final int MAX_LIST_ALIASES_LIMIT = 100;
+
+    public Page<KmsKey> listKeys(String region, String marker, Integer limit) {
+        return page(listKeys(region), KmsKey::getKeyId,
+                "ListKeys\n" + regionResolver.getAccountId() + "\n" + region, marker, limit, MAX_LIST_KEYS_LIMIT);
+    }
+
+    public Page<KmsAlias> listAliases(String keyId, String region, String marker, Integer limit) {
+        // Resolve the filter once: an alias given as KeyId could be repointed between two lookups,
+        // leaving a page of one key's aliases with a marker signed for another.
+        String filter = keyId == null || keyId.isBlank() ? null : resolveKey(keyId, region).getKeyId();
+        return page(listAliases(filter, region), KmsAlias::getAliasName,
+                "ListAliases\n" + regionResolver.getAccountId() + "\n" + region + "\n" + (filter == null ? "" : filter),
+                marker, limit, MAX_LIST_ALIASES_LIMIT);
+    }
+
+    /** Signs each ListKeys/ListAliases Marker, so only a marker this service issued is accepted. */
+    private final SignedMarkers listMarkers = new SignedMarkers();
+
+    /**
+     * Pages {@code items} sorted by id. Marker is a signed cursor naming the id of the last item
+     * returned; the next page starts at the first id sorting after it, so deleting that item
+     * between pages does not break the listing (as upstream IAM pagination does). The cursor also
+     * carries {@code context} (action, account, region and filter), so a marker is only accepted by the
+     * listing that issued it. Any other marker is InvalidMarkerException. Limit is clamped to
+     * [1..max]; without a Limit the whole remainder is returned, so callers that never page see
+     * every entry.
+     */
+    private <T> Page<T> page(List<T> items, Function<T, String> id, String context,
+                             String marker, Integer limit, int max) {
+        String scope = context + "\n";
+        List<T> sorted = items.stream().sorted(Comparator.comparing(id)).toList();
+        int startIndex = 0;
+        if (marker != null) {
+            // A blank marker was not issued here, so it is refused rather than restarting the listing.
+            String cursor = listMarkers.cursorOf(marker.trim());
+            if (cursor == null || !cursor.startsWith(scope)) {
+                throw new AwsException("InvalidMarkerException",
+                        "The request was rejected because the marker that specifies where pagination should next begin is not valid.", 400);
+            }
+            String anchor = cursor.substring(scope.length());
+            while (startIndex < sorted.size() && id.apply(sorted.get(startIndex)).compareTo(anchor) <= 0) {
+                startIndex++;
+            }
+        }
+        int endIndex = limit == null ? sorted.size()
+                : Math.min(startIndex + Math.clamp(limit, 1, max), sorted.size());
+        List<T> pageItems = sorted.subList(startIndex, endIndex);
+        String nextMarker = endIndex < sorted.size() ? listMarkers.issue(scope + id.apply(pageItems.getLast())) : null;
+        return new Page<>(pageItems, nextMarker);
     }
 
     private Map<String, Object> grantToMap(KmsGrant grant) {

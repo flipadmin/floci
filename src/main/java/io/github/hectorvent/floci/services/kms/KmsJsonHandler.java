@@ -174,16 +174,61 @@ public class KmsJsonHandler {
     }
 
     private Response handleListKeys(JsonNode request, String region) {
-        List<KmsKey> keys = service.listKeys(region);
+        KmsService.Page<KmsKey> page = service.listKeys(region, marker(request), limit(request));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("Keys");
-        for (KmsKey k : keys) {
+        for (KmsKey k : page.items()) {
             ObjectNode entry = array.addObject();
             entry.put("KeyId", k.getKeyId());
             entry.put("KeyArn", k.getArn());
         }
-        response.put("Truncated", false);
+        putTruncation(response, page);
         return Response.ok(response).build();
+    }
+
+    /** MarkerType has length >= 1 in the model, so a present but empty Marker is refused, not ignored. */
+    private static String marker(JsonNode request) {
+        JsonNode node = request.path("Marker");
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isTextual()) {
+            // MarkerType is a string; any other JSON value is refused rather than coerced.
+            String token = node.isNumber() ? "NUMBER_VALUE"
+                    : node.isBoolean() ? (node.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE")
+                    : node.isArray() ? "START_ARRAY" : "START_OBJECT";
+            throw new AwsException("SerializationException", token + " can not be converted to a String", 400);
+        }
+        String marker = node.textValue();
+        if (marker.isEmpty()) {
+            throw SmithyValidationErrors.validationException("Value '' at 'marker' failed to satisfy constraint: "
+                    + "Member must have length greater than or equal to 1");
+        }
+        return marker;
+    }
+
+    /**
+     * The model types Limit as an integer in LimitType [1..1000], so anything else is refused
+     * rather than coerced. A Limit above an action's documented page size is clamped by the service.
+     */
+    private static Integer limit(JsonNode request) {
+        JsonNode limit = request.path("Limit");
+        if (limit.isMissingNode() || limit.isNull()) {
+            return null;
+        }
+        if (!limit.isIntegralNumber() || !limit.canConvertToInt()) {
+            throw new AwsException("SerializationException",
+                    (limit.isNumber() ? "NUMBER_VALUE" : "STRING_VALUE") + " can not be converted to an Integer", 400);
+        }
+        validateRange("limit", limit.intValue(), 1, 1000);
+        return limit.intValue();
+    }
+
+    private static void putTruncation(ObjectNode response, KmsService.Page<?> page) {
+        response.put("Truncated", page.truncated());
+        if (page.truncated()) {
+            response.put("NextMarker", page.nextMarker());
+        }
     }
 
     private Response handleListGrants(JsonNode request, String region) {
@@ -467,17 +512,17 @@ public class KmsJsonHandler {
     private Response handleListAliases(JsonNode request, String region) {
         JsonNode keyIdNode = request.path("KeyId");
         String keyId = (keyIdNode.isMissingNode() || keyIdNode.isNull()) ? null : keyIdNode.asText();
-        List<KmsAlias> aliases = service.listAliases(keyId, region);
+        KmsService.Page<KmsAlias> page = service.listAliases(keyId, region, marker(request), limit(request));
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("Aliases");
-        for (KmsAlias a : aliases) {
+        for (KmsAlias a : page.items()) {
             ObjectNode entry = array.addObject();
             entry.put("AliasName", a.getAliasName());
             entry.put("AliasArn", a.getAliasArn());
             entry.put("TargetKeyId", a.getTargetKeyId());
             entry.put("CreationDate", a.getCreationDate());
         }
-        response.put("Truncated", false);
+        putTruncation(response, page);
         return Response.ok(response).build();
     }
 

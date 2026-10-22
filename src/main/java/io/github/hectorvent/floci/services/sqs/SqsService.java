@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig.SqsServiceConfig.EndpointStrategy;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -62,7 +63,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
-public class SqsService implements Resettable, ResourceProvider {
+public class SqsService implements Resettable, ResourceProvider, AccountCloneable {
 
     private static final Logger LOG = Logger.getLogger(SqsService.class);
     private static final int DEDUP_WINDOW_SECONDS = 300; // 5 minutes
@@ -80,6 +81,8 @@ public class SqsService implements Resettable, ResourceProvider {
     private static final int DEFAULT_MESSAGE_RETENTION_PERIOD_SECONDS = 345600;
     private static final int MIN_MESSAGE_RETENTION_PERIOD_SECONDS = 60;
     private static final int MAX_MESSAGE_RETENTION_PERIOD_SECONDS = 1209600;
+    private static final ObjectMapper CLONE_MAPPER = new ObjectMapper().registerModule(new JavaTimeModule());
+    private static final TypeReference<List<Message>> MESSAGE_LIST_TYPE = new TypeReference<>() {};
 
     private final StorageBackend<String, Queue> queueStore;
     private final StorageBackend<String, List<Message>> messageStore;
@@ -2248,5 +2251,124 @@ public class SqsService implements Resettable, ResourceProvider {
         int slash = trimmed.indexOf('/');
         String candidate = slash > 0 ? trimmed.substring(0, slash) : trimmed;
         return candidate.matches("\\d{12}") ? candidate : null;
+    }
+
+    /** Same extraction as {@link #accountFromQueueUrl}, applied to a storageKey ("region::/accountId/queueName"). */
+    private static String accountFromStorageKey(String storageKey) {
+        int sep = storageKey.indexOf("::");
+        return sep < 0 ? null : accountFromQueueUrl(storageKey.substring(sep + 2));
+    }
+
+    // --- AccountCloneable ---
+    // The "sqs" stores (queues, messages, dedup windows, dedup identities) are plain
+    // AccountAwareStorageBackend fields, but unlike DynamoDB/S3 a generic clone into a different
+    // target account isn't correct on its own here: the queue's identity (queueUrl, and the
+    // storageKey derived from it) bakes sourceAccountId into its path, so a shallow copy would
+    // leave the target account owning queues whose own URL/ARN still points at the source
+    // account. This rebuilds each queue's storageKey/URL/ARN under the target account instead of
+    // trusting whatever the generic pass already copied, starting with an explicit clear so
+    // nothing stale from that generic pass lingers. messagesByQueue and the FIFO deduplication
+    // caches are in-memory state the generic pass can't reach, so they are rebuilt from the cloned
+    // stores. queueLocks/redrivePolicyCache/deduplicationLocks are created lazily on next access,
+    // so they're only cleared, never cloned; moveTasksByHandle/moveTaskCancellation are
+    // background-job bookkeeping, left alone.
+
+    @Override
+    public String serviceName() {
+        return "sqs";
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        if (!(queueStore instanceof AccountAwareStorageBackend<Queue> awareQueues)) {
+            return;
+        }
+        clearAccountData(targetAccountId);
+
+        AccountAwareStorageBackend<List<Message>> awareMessages =
+                messageStore instanceof AccountAwareStorageBackend<List<Message>> a ? a : null;
+        AccountAwareStorageBackend<Map<String, Long>> awareDedup =
+                dedupStore instanceof AccountAwareStorageBackend<Map<String, Long>> a ? a : null;
+        AccountAwareStorageBackend<Map<String, Map<String, String>>> awareDedupIdentities =
+                dedupIdentityStore instanceof AccountAwareStorageBackend<Map<String, Map<String, String>>> a ? a : null;
+        Instant now = clock.instant();
+
+        for (String sourceStorageKey : awareQueues.keysForAccount(sourceAccountId)) {
+            Queue sourceQueue = awareQueues.getForAccount(sourceAccountId, sourceStorageKey).orElse(null);
+            if (sourceQueue == null) {
+                continue;
+            }
+            String region = sourceStorageKey.substring(0, sourceStorageKey.indexOf("::"));
+            String queueName = sourceQueue.getQueueName();
+            String targetQueueUrl = buildQueueUrl(region, targetAccountId, queueName);
+            String targetStorageKey = regionKey(region, targetQueueUrl);
+
+            Queue targetQueue = new Queue(queueName, targetQueueUrl);
+            targetQueue.setAccountId(targetAccountId);
+            targetQueue.setAttributes(new HashMap<>(sourceQueue.getAttributes()));
+            targetQueue.setTags(new HashMap<>(sourceQueue.getTags()));
+            targetQueue.setCreatedTimestamp(sourceQueue.getCreatedTimestamp());
+            targetQueue.setLastModifiedTimestamp(sourceQueue.getLastModifiedTimestamp());
+            if (targetQueue.getAttributes().containsKey("QueueArn")) {
+                targetQueue.getAttributes().put("QueueArn",
+                        AwsArnUtils.Arn.of("sqs", region, targetAccountId, queueName).toString());
+            }
+            awareQueues.putForAccount(targetAccountId, targetStorageKey, targetQueue);
+
+            List<Message> clonedMessages = null;
+            if (awareMessages != null) {
+                List<Message> sourceMessages = awareMessages.getForAccount(sourceAccountId, sourceStorageKey).orElse(null);
+                if (sourceMessages != null) {
+                    clonedMessages = CLONE_MAPPER.convertValue(sourceMessages, MESSAGE_LIST_TYPE);
+                    awareMessages.putForAccount(targetAccountId, targetStorageKey, clonedMessages);
+                }
+            }
+            messagesByQueue.put(targetStorageKey, new GuardedMessageQueue(
+                    clonedMessages == null ? new ArrayList<>() : clonedMessages,
+                    messageStore, targetStorageKey, receiptHandleSecret));
+
+            if (awareDedup != null) {
+                awareDedup.getForAccount(sourceAccountId, sourceStorageKey).ifPresent(dedup -> {
+                    awareDedup.putForAccount(targetAccountId, targetStorageKey, new HashMap<>(dedup));
+                    loadDedupEntries(targetStorageKey, dedup, now);
+                });
+            }
+            if (awareDedupIdentities != null) {
+                awareDedupIdentities.getForAccount(sourceAccountId, sourceStorageKey).ifPresent(identities -> {
+                    Map<String, Map<String, String>> copy = new HashMap<>();
+                    identities.forEach((dedupKey, fields) -> copy.put(dedupKey, new HashMap<>(fields)));
+                    awareDedupIdentities.putForAccount(targetAccountId, targetStorageKey, copy);
+                    loadDedupIdentities(targetStorageKey, copy);
+                });
+            }
+        }
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        if (queueStore instanceof AccountAwareStorageBackend<Queue> awareQueues) {
+            awareQueues.clearForAccount(accountId);
+        }
+        if (messageStore instanceof AccountAwareStorageBackend<List<Message>> awareMessages) {
+            awareMessages.clearForAccount(accountId);
+        }
+        if (dedupStore instanceof AccountAwareStorageBackend<Map<String, Long>> awareDedup) {
+            awareDedup.clearForAccount(accountId);
+        }
+        if (dedupIdentityStore instanceof AccountAwareStorageBackend<Map<String, Map<String, String>>> awareIdentities) {
+            awareIdentities.clearForAccount(accountId);
+        }
+        messagesByQueue.entrySet().removeIf(entry -> {
+            if (!accountId.equals(accountFromStorageKey(entry.getKey()))) {
+                return false;
+            }
+            entry.getValue().close();
+            return true;
+        });
+        queueLocks.keySet().removeIf(k -> accountId.equals(accountFromStorageKey(k)));
+        redrivePolicyCache.keySet().removeIf(k -> accountId.equals(accountFromStorageKey(k)));
+        deduplicationCache.keySet().removeIf(k -> accountId.equals(accountFromStorageKey(k)));
+        deduplicationIdentityCache.keySet().removeIf(k -> accountId.equals(accountFromStorageKey(k)));
+        deduplicationLocks.keySet().removeIf(k -> accountId.equals(accountFromStorageKey(k)));
     }
 }

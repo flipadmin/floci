@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
@@ -101,7 +102,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 @ApplicationScoped
-public class S3Service implements Resettable, ResourceProvider {
+public class S3Service implements Resettable, ResourceProvider, AccountCloneable {
     private String ownerId() {
         if (regionResolver != null) {
             return regionResolver.getAccountId();
@@ -475,6 +476,19 @@ public class S3Service implements Resettable, ResourceProvider {
     public Bucket createBucket(String bucketName, String region, String requestedOwnership,
                                String cannedAcl, String grantRead, String grantWrite,
                                String grantFullControl, String grantReadAcp, String grantWriteAcp) {
+        return createBucket(bucketName, region, requestedOwnership, cannedAcl, grantRead, grantWrite,
+                grantFullControl, grantReadAcp, grantWriteAcp, false);
+    }
+
+    /** Creates an account-scoped Floci staging bucket, independently of the public bucket namespace. */
+    public Bucket createInternalBucket(String bucketName, String region) {
+        return createBucket(bucketName, region, null, null, null, null, null, null, null, true);
+    }
+
+    private Bucket createBucket(String bucketName, String region, String requestedOwnership,
+                                String cannedAcl, String grantRead, String grantWrite,
+                                String grantFullControl, String grantReadAcp, String grantWriteAcp,
+                                boolean internal) {
         requirePathSafeBucketName(bucketName);
         String ownership = requestedOwnership == null ? "BucketOwnerEnforced" : requestedOwnership;
         if (!OBJECT_OWNERSHIP_VALUES.contains(ownership)) {
@@ -498,15 +512,28 @@ public class S3Service implements Resettable, ResourceProvider {
             throw new AwsException("InvalidBucketAclWithBlockPublicAccessError",
                     "Bucket cannot have public ACLs set with BlockPublicAccess enabled", 400);
         }
-        var existing = bucketStore.get(bucketName);
+        // Share deletion's name lock so checking availability and publishing an owner are atomic.
+        return withLock(multipartBucketLock(bucketName).writeLock(),
+                () -> createBucketLocked(bucketName, region, ownership, requestedAcl, internal));
+    }
+
+    private Bucket createBucketLocked(String bucketName, String region, String ownership, String requestedAcl,
+                                      boolean internal) {
+        Optional<Bucket> existing = bucketStore.get(bucketName);
         if (existing.isPresent()) {
             Bucket bucket = existing.get();
-            if (isDefaultS3Region(bucket.getRegion()) && isDefaultS3Region(region)) {
+            if (!internal && isDefaultS3Region(bucket.getRegion()) && isDefaultS3Region(region)) {
                 LOG.infov("Bucket already exists in default region, treating CreateBucket as idempotent: {0}", bucketName);
                 return bucket;
             }
             throw new AwsException("BucketAlreadyOwnedByYou",
                     "Your previous request to create the named bucket succeeded and you already own it.", 409);
+        }
+        if (!internal && globalBucketNamespace && resolveBucketEntry(bucketName).isPresent()) {
+            throw new AwsException("BucketAlreadyExists",
+                    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. "
+                            + "Please select a different name and try again.",
+                    409);
         }
 
         Bucket bucket = new Bucket(bucketName);
@@ -1730,7 +1757,7 @@ public class S3Service implements Resettable, ResourceProvider {
             return false;
         }
         if (versionId == null && bucket.get().value().isVersioningEnabled()) {
-            boolean currentIsVersioned = objectStore.get(objectKey(bucketName, key))
+            boolean currentIsVersioned = resolveObjectForAccount(bucket.get().account(), objectKey(bucketName, key))
                     .map(current -> current.getVersionId() != null)
                     .orElse(true);
             if (currentIsVersioned) {
@@ -2114,18 +2141,21 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     public S3Object deleteObject(String bucketName, String key, String versionId, boolean bypassGovernance,
                                  String ifMatch) {
-        Bucket bucket = bucketStore.get(bucketName)
+        AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
+        Bucket bucket = ownedBucket.value();
 
         // The bucket monitor serializes this against PutObject's annotation cleanup and the
         // annotation subresource writes, which hold the same monitor (storeObjectInternal
         // already runs under it via storeObject). The precondition is checked under it too,
         // so a concurrent overwrite cannot land between the check and the delete.
-        synchronized (bucket) {
-            checkDeletePrecondition(bucketName, key, ifMatch);
-            return deleteObjectLocked(bucket, bucketName, key, versionId, bypassGovernance, OBJECT_REMOVED_EVENT);
-        }
+        return RequestScopes.callAs(ownedBucket.account(), () -> {
+            synchronized (bucket) {
+                checkDeletePrecondition(bucketName, key, ifMatch);
+                return deleteObjectLocked(bucket, bucketName, key, versionId, bypassGovernance, OBJECT_REMOVED_EVENT);
+            }
+        });
     }
 
     /**
@@ -2300,8 +2330,8 @@ public class S3Service implements Resettable, ResourceProvider {
      * entry must not make that entry require {@code s3:BypassGovernanceRetention}.
      */
     public boolean isGovernanceRetentionActive(String bucketName, String key, String versionId) {
-        ensureBucketExists(bucketName);
-        S3Object object = objectStore.get(versionStoreKey(bucketName, key, versionId))
+        String bucketOwnerAccount = getBucketOwnerAccountId(bucketName);
+        S3Object object = resolveObjectForAccount(bucketOwnerAccount, versionStoreKey(bucketName, key, versionId))
                 .filter(existing -> isNamedVersion(existing, versionId))
                 .orElse(null);
         return object != null
@@ -2323,14 +2353,18 @@ public class S3Service implements Resettable, ResourceProvider {
 
     public ListObjectsResult listObjectsWithPrefixes(String bucketName, String prefix, String delimiter, int maxKeys,
                                                      String continuationToken, String startAfter) {
-        ensureBucketExists(bucketName);
+        String bucketOwnerAccount = resolveBucketEntry(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404))
+                .account();
 
         String keyPrefix = bucketName + "/";
         String fullPrefix = prefix != null ? keyPrefix + prefix : keyPrefix;
 
         // Filter out versioned entries (contain #v#) and delete markers
-        List<S3Object> allObjects = objectStore.scan(key ->
-                        key.startsWith(fullPrefix) && !key.contains("#v#"))
+        Predicate<String> keyFilter = key -> key.startsWith(fullPrefix) && !key.contains("#v#");
+        List<S3Object> storedObjects = scanObjectsForAccount(bucketOwnerAccount, keyFilter);
+        List<S3Object> allObjects = storedObjects
                 .stream()
                 .filter(obj -> !obj.isDeleteMarker())
                 .toList();
@@ -4662,6 +4696,18 @@ public class S3Service implements Resettable, ResourceProvider {
     public S3Object completeMultipartUpload(String bucket, String key, String uploadId, List<Integer> partNumbers,
                                             Map<Integer, String> partETags, Map<Integer, S3Checksum> partChecksums,
                                             String checksumType, S3Checksum expectedChecksum, Long expectedObjectSize) {
+        return completeMultipartUpload(bucket, key, uploadId, partNumbers, partETags, partChecksums,
+                checksumType, expectedChecksum, expectedObjectSize, null, null);
+    }
+
+    /**
+     * {@code ifMatch} and {@code ifNoneMatch} are judged by storeObject under the bucket's monitor,
+     * together with the write, so concurrent conditional completions on one key cannot all succeed.
+     */
+    public S3Object completeMultipartUpload(String bucket, String key, String uploadId, List<Integer> partNumbers,
+                                            Map<Integer, String> partETags, Map<Integer, S3Checksum> partChecksums,
+                                            String checksumType, S3Checksum expectedChecksum, Long expectedObjectSize,
+                                            String ifMatch, String ifNoneMatch) {
         S3Object completed = withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
 
@@ -4755,7 +4801,9 @@ public class S3Service implements Resettable, ResourceProvider {
                                     .withObjectLockMode(upload.getObjectLockMode())
                                     .withRetainUntilDate(upload.getRetainUntilDate())
                                     .withLegalHoldStatus(upload.getLegalHoldStatus())
-                                    .withTagging(upload.getTagging()),
+                                    .withTagging(upload.getTagging())
+                                    .withIfMatch(ifMatch)
+                                    .withIfNoneMatch(ifNoneMatch),
                             compositeETag,
                             upload.getInitiatorAccountId() != null ? upload.getInitiatorAccountId() : ownerId());
                 } finally {
@@ -6454,7 +6502,7 @@ public class S3Service implements Resettable, ResourceProvider {
                             throw new AwsException("InvalidParameterValueException",
                                     "Invalid Lambda function ARN: " + ln.functionArn(), 400);
                         }
-                        invokeLambda(lambdaRegion, functionName, eventJson.getBytes(StandardCharsets.UTF_8));
+                        invokeLambda(lambdaRegion, ln.functionArn(), eventJson.getBytes(StandardCharsets.UTF_8));
                         LOG.debugv("Fired S3 event {0} to Lambda {1}", eventName, ln.functionArn());
                     } catch (Exception e) {
                         LOG.warnv("Failed to deliver S3 event to Lambda {0}: {1}", ln.functionArn(), e.getMessage());
@@ -6835,7 +6883,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * Resolves a bucket for existence/access. With {@code globalBucketNamespace} enabled, the
      * lookup spans every account's partition (AWS bucket names are globally unique and reachable
      * cross-account); otherwise it stays scoped to the calling account. Write-side ownership
-     * checks (CreateBucket, delete) intentionally do not use this — they remain account-scoped.
+     * checks (CreateBucket, DeleteBucket) intentionally do not use this; they remain account-scoped.
      */
     private Optional<Bucket> resolveBucket(String bucketName) {
         return resolveBucketEntry(bucketName).map(AccountAwareStorageBackend.OwnedEntry::value);
@@ -6917,9 +6965,19 @@ public class S3Service implements Resettable, ResourceProvider {
         if (objectStore instanceof AccountAwareStorageBackend<?> aware) {
             @SuppressWarnings("unchecked")
             AccountAwareStorageBackend<S3Object> typed = (AccountAwareStorageBackend<S3Object>) aware;
-            return typed.getForAccount(accountId, storeKey);
+            return typed.getForAccount(accountId, storeKey)
+                    .or(() -> typed.getLegacyForAccount(accountId, storeKey));
         }
         return objectStore.get(storeKey);
+    }
+
+    private List<S3Object> scanObjectsForAccount(String accountId, Predicate<String> keyFilter) {
+        if (globalBucketNamespace && objectStore instanceof AccountAwareStorageBackend<?> aware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<S3Object> typed = (AccountAwareStorageBackend<S3Object>) aware;
+            return typed.scanForAccount(accountId, keyFilter);
+        }
+        return objectStore.scan(keyFilter);
     }
 
     private void putObjectForAccount(String accountId, String storeKey, S3Object object) {
@@ -7361,6 +7419,85 @@ public class S3Service implements Resettable, ResourceProvider {
         } catch (IOException e) {
             LOG.errorv(e, "Failed to delete directory: {0}", dir);
         }
+    }
+
+    private void copyDirectory(Path source, Path target) {
+        if (!Files.exists(source)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(source)) {
+            walk.forEach(path -> {
+                try {
+                    Path dest = target.resolve(source.relativize(path));
+                    if (Files.isDirectory(path)) {
+                        Files.createDirectories(dest);
+                    } else {
+                        Files.createDirectories(dest.getParent());
+                        Files.copy(path, dest);
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to copy " + path + " to account-scoped layout", e);
+                }
+            });
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to walk directory for account clone: " + source, e);
+        }
+    }
+
+    // --- AccountCloneable ---
+    // The "s3" stores (buckets, objects, annotations, account Block Public Access) are already
+    // cloned/cleared generically. This handles what that can't: the object and annotation payload
+    // bytes held outside them (memoryDataStore/memoryAnnotationStore, or the account's directory on
+    // disk), and the account's in-progress multipart uploads. No ARN rewrite is needed here, unlike
+    // DynamoDB/SQS/SNS: real S3 bucket ARNs never include the account ID ("arn:<partition>:s3:::bucket").
+    // In-progress multipart uploads are transient, so a clone does not copy them.
+
+    @Override
+    public String serviceName() {
+        return "s3";
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        clearAccountPayloads(targetAccountId);
+        if (inMemory) {
+            copyAccountEntries(memoryDataStore, targetAccountId, sourceAccountId);
+            copyAccountEntries(memoryAnnotationStore, targetAccountId, sourceAccountId);
+            return;
+        }
+        copyDirectory(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(sourceAccountId),
+                dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(targetAccountId));
+    }
+
+    private static void copyAccountEntries(Map<String, byte[]> store, String targetAccountId, String sourceAccountId) {
+        String sourcePrefix = sourceAccountId + "/";
+        for (Map.Entry<String, byte[]> entry : store.entrySet()) {
+            if (entry.getKey().startsWith(sourcePrefix)) {
+                String rest = entry.getKey().substring(sourcePrefix.length());
+                store.put(targetAccountId + "/" + rest, Arrays.copyOf(entry.getValue(), entry.getValue().length));
+            }
+        }
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        for (MultipartUpload upload : List.copyOf(multipartUploads.values())) {
+            if (accountId.equals(upload.getOwnerAccountId())) {
+                withMultipartOperationLock(upload.getBucket(), upload.getUploadId(),
+                        () -> cleanupMultipart(upload.getUploadId()));
+            }
+        }
+        clearAccountPayloads(accountId);
+    }
+
+    private void clearAccountPayloads(String accountId) {
+        if (inMemory) {
+            String prefix = accountId + "/";
+            memoryDataStore.keySet().removeIf(k -> k.startsWith(prefix));
+            memoryAnnotationStore.keySet().removeIf(k -> k.startsWith(prefix));
+            return;
+        }
+        deleteDirectory(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId));
     }
 
     private S3Object copyS3Object(String sourceBucket, String sourceKey,

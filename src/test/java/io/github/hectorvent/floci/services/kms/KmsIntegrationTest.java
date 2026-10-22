@@ -22,8 +22,10 @@ import java.security.PublicKey;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
 
 import static io.restassured.RestAssured.given;
@@ -853,6 +855,368 @@ class KmsIntegrationTest {
                 .header("X-Amz-Target", "TrentService.ListGrants")
                 .contentType(KMS_CONTENT_TYPE)
                 .body("{\"KeyId\":\"" + keyId + "\",\"Marker\":\"bad-marker\"}")
+                .when().post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo("InvalidMarkerException"));
+    }
+
+    @Test
+    void listKeysPagesWithLimitAndMarker() {
+        for (int i = 0; i < 2; i++) {
+            given()
+                    .header("X-Amz-Target", "TrentService.CreateKey")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{}")
+                    .when().post("/")
+                    .then().statusCode(200);
+        }
+
+        JsonPath unpaged = given()
+                .header("X-Amz-Target", "TrentService.ListKeys")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{}")
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Truncated", equalTo(false))
+                .body("$", not(hasKey("NextMarker")))
+                .extract().jsonPath();
+        List<String> allKeyIds = unpaged.getList("Keys.KeyId");
+        assertTrue(allKeyIds.size() >= 2);
+
+        List<String> pagedKeyIds = new ArrayList<>();
+        String marker = null;
+        do {
+            String body = marker == null ? "{\"Limit\":1}" : "{\"Limit\":1,\"Marker\":\"" + marker + "\"}";
+            JsonPath page = given()
+                    .header("X-Amz-Target", "TrentService.ListKeys")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body(body)
+                    .when().post("/")
+                    .then()
+                    .statusCode(200)
+                    .body("Keys.size()", equalTo(1))
+                    .extract().jsonPath();
+            pagedKeyIds.addAll(page.getList("Keys.KeyId"));
+            marker = page.getBoolean("Truncated") ? page.getString("NextMarker") : null;
+            assertTrue(pagedKeyIds.size() <= allKeyIds.size(), "paging did not terminate");
+        } while (marker != null);
+
+        assertEquals(new HashSet<>(allKeyIds), new HashSet<>(pagedKeyIds));
+        assertEquals(allKeyIds.size(), pagedKeyIds.size());
+    }
+
+    @Test
+    void listAliasesPagesAfterKeyIdFilter() {
+        String keyId = given()
+                .header("X-Amz-Target", "TrentService.CreateKey")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{}")
+                .when().post("/")
+                .then().statusCode(200)
+                .extract().path("KeyMetadata.KeyId");
+
+        String prefix = "alias/paging-" + System.nanoTime() + "-";
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("X-Amz-Target", "TrentService.CreateAlias")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"AliasName\":\"" + prefix + i + "\",\"TargetKeyId\":\"" + keyId + "\"}")
+                    .when().post("/")
+                    .then().statusCode(200);
+        }
+
+        JsonPath first = given()
+                .header("X-Amz-Target", "TrentService.ListAliases")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"KeyId\":\"" + keyId + "\",\"Limit\":2}")
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Aliases.size()", equalTo(2))
+                .body("Truncated", equalTo(true))
+                .body("NextMarker", notNullValue())
+                .extract().jsonPath();
+
+        JsonPath second = given()
+                .header("X-Amz-Target", "TrentService.ListAliases")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"KeyId\":\"" + keyId + "\",\"Limit\":2,\"Marker\":\"" + first.getString("NextMarker") + "\"}")
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Aliases.size()", equalTo(1))
+                .body("Truncated", equalTo(false))
+                .body("$", not(hasKey("NextMarker")))
+                .extract().jsonPath();
+
+        List<String> names = new ArrayList<>(first.getList("Aliases.AliasName"));
+        names.addAll(second.getList("Aliases.AliasName"));
+        assertEquals(List.of(prefix + 0, prefix + 1, prefix + 2), names);
+        assertTrue(second.getList("Aliases.TargetKeyId").stream().allMatch(keyId::equals));
+    }
+
+    @Test
+    void listAliasesResumesAfterMarkedAliasIsDeleted() {
+        String keyId = given()
+                .header("X-Amz-Target", "TrentService.CreateKey")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{}")
+                .when().post("/")
+                .then().statusCode(200)
+                .extract().path("KeyMetadata.KeyId");
+
+        String prefix = "alias/resume-" + System.nanoTime() + "-";
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("X-Amz-Target", "TrentService.CreateAlias")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"AliasName\":\"" + prefix + i + "\",\"TargetKeyId\":\"" + keyId + "\"}")
+                    .when().post("/")
+                    .then().statusCode(200);
+        }
+
+        String marker = given()
+                .header("X-Amz-Target", "TrentService.ListAliases")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"KeyId\":\"" + keyId + "\",\"Limit\":1}")
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Aliases.AliasName", equalTo(List.of(prefix + 0)))
+                .body("Truncated", equalTo(true))
+                .extract().path("NextMarker");
+
+        // Delete-while-listing, as Terraform and cloud-nuke do: the alias the marker names is gone.
+        given()
+                .header("X-Amz-Target", "TrentService.DeleteAlias")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"AliasName\":\"" + prefix + 0 + "\"}")
+                .when().post("/")
+                .then().statusCode(200);
+
+        given()
+                .header("X-Amz-Target", "TrentService.ListAliases")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"KeyId\":\"" + keyId + "\",\"Limit\":1,\"Marker\":\"" + marker + "\"}")
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Aliases.AliasName", equalTo(List.of(prefix + 1)))
+                .body("Truncated", equalTo(true));
+    }
+
+    @Test
+    void listAliasesClampsLimitToDocumentedMaximum() {
+        String keyId = given()
+                .header("X-Amz-Target", "TrentService.CreateKey")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{}")
+                .when().post("/")
+                .then().statusCode(200)
+                .extract().path("KeyMetadata.KeyId");
+
+        String prefix = "alias/clamp-" + System.nanoTime() + "-";
+        for (int i = 0; i < 101; i++) {
+            given()
+                    .header("X-Amz-Target", "TrentService.CreateAlias")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"AliasName\":\"" + prefix + i + "\",\"TargetKeyId\":\"" + keyId + "\"}")
+                    .when().post("/")
+                    .then().statusCode(200);
+        }
+
+        // The ListAliases reference allows Limit 1-100, so a larger Limit returns at most 100.
+        given()
+                .header("X-Amz-Target", "TrentService.ListAliases")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"KeyId\":\"" + keyId + "\",\"Limit\":1000}")
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Aliases.size()", equalTo(100))
+                .body("Truncated", equalTo(true))
+                .body("NextMarker", notNullValue());
+    }
+
+    @Test
+    void listMarkerIsRejectedOutsideTheListingThatIssuedIt() {
+        String keyId = given()
+                .header("X-Amz-Target", "TrentService.CreateKey")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{}")
+                .when().post("/")
+                .then().statusCode(200)
+                .extract().path("KeyMetadata.KeyId");
+        String prefix = "alias/context-" + System.nanoTime() + "-";
+        for (int i = 0; i < 2; i++) {
+            given()
+                    .header("X-Amz-Target", "TrentService.CreateAlias")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"AliasName\":\"" + prefix + i + "\",\"TargetKeyId\":\"" + keyId + "\"}")
+                    .when().post("/")
+                    .then().statusCode(200);
+        }
+        String marker = given()
+                .header("X-Amz-Target", "TrentService.ListAliases")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"KeyId\":\"" + keyId + "\",\"Limit\":1}")
+                .when().post("/")
+                .then().statusCode(200)
+                .body("Truncated", equalTo(true))
+                .extract().path("NextMarker");
+
+        // Same action without the KeyId filter, and another action, must not accept it.
+        for (String[] reuse : new String[][] {
+                {"ListAliases", "{\"Marker\":\"" + marker + "\"}"},
+                {"ListKeys", "{\"Marker\":\"" + marker + "\"}"}}) {
+            given()
+                    .header("X-Amz-Target", "TrentService." + reuse[0])
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body(reuse[1])
+                    .when().post("/")
+                    .then()
+                    .statusCode(400)
+                    .body("__type", equalTo("InvalidMarkerException"));
+        }
+    }
+
+    @Test
+    void listAliasesMarkerIsBoundToTheResolvedKeyId() {
+        String keyId = given()
+                .header("X-Amz-Target", "TrentService.CreateKey")
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{}")
+                .when().post("/")
+                .then().statusCode(200)
+                .extract().path("KeyMetadata.KeyId");
+        String prefix = "alias/bound-" + System.nanoTime() + "-";
+        for (int i = 0; i < 3; i++) {
+            given()
+                    .header("X-Amz-Target", "TrentService.CreateAlias")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"AliasName\":\"" + prefix + i + "\",\"TargetKeyId\":\"" + keyId + "\"}")
+                    .when().post("/")
+                    .then().statusCode(200);
+        }
+
+        // A marker minted with the filter as an alias name pages on with the filter as the key id,
+        // and the other way round: the marker names the key the page was filtered by.
+        String[][] pairs = {{prefix + 0, keyId}, {keyId, prefix + 0}};
+        for (String[] pair : pairs) {
+            String marker = given()
+                    .header("X-Amz-Target", "TrentService.ListAliases")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"KeyId\":\"" + pair[0] + "\",\"Limit\":1}")
+                    .when().post("/")
+                    .then().statusCode(200)
+                    .body("Aliases.AliasName", equalTo(List.of(prefix + 0)))
+                    .extract().path("NextMarker");
+            given()
+                    .header("X-Amz-Target", "TrentService.ListAliases")
+                    .contentType(KMS_CONTENT_TYPE)
+                    .body("{\"KeyId\":\"" + pair[1] + "\",\"Limit\":1,\"Marker\":\"" + marker + "\"}")
+                    .when().post("/")
+                    .then().statusCode(200)
+                    .body("Aliases.AliasName", equalTo(List.of(prefix + 1)));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "ListKeys|0|ValidationException",
+            "ListAliases|-1|ValidationException",
+            "ListAliases|1001|ValidationException",
+            "ListKeys|\"abc\"|SerializationException",
+            "ListAliases|1.5|SerializationException"})
+    void listKeysAndAliasesRejectLimitOutsideTheModel(String action, String limit, String errorType) {
+        given()
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Limit\":" + limit + "}")
+                .when().post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo(errorType));
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "ListKeys|''|ValidationException",
+            "ListAliases|''|ValidationException",
+            "ListKeys|' '|InvalidMarkerException",
+            "ListAliases|' '|InvalidMarkerException"})
+    void listKeysAndAliasesRejectBlankMarker(String action, String marker, String errorType) {
+        given()
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Marker\":\"" + marker + "\"}")
+                .when().post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo(errorType));
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "ListKeys|{}", "ListKeys|[]", "ListKeys|1", "ListKeys|true",
+            "ListAliases|{}", "ListAliases|[]", "ListAliases|1", "ListAliases|true"})
+    void listKeysAndAliasesRejectNonStringMarker(String action, String marker) {
+        given()
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Marker\":" + marker + "}")
+                .when().post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo("SerializationException"));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ListKeys", "ListAliases"})
+    void listMarkerIsRejectedInAnotherAccount(String action) {
+        String issuer = "AWS4-HMAC-SHA256 Credential=000000000101/20260215/us-east-1/kms/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        String other = "AWS4-HMAC-SHA256 Credential=000000000102/20260215/us-east-1/kms/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        // Both accounts list the AWS managed keys and aliases, so the first page is truncated.
+        String marker = given()
+                .header("Authorization", issuer)
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Limit\":1}")
+                .when().post("/")
+                .then().statusCode(200)
+                .body("Truncated", equalTo(true))
+                .extract().path("NextMarker");
+
+        given()
+                .header("Authorization", other)
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Limit\":1,\"Marker\":\"" + marker + "\"}")
+                .when().post("/")
+                .then()
+                .statusCode(400)
+                .body("__type", equalTo("InvalidMarkerException"));
+
+        given()
+                .header("Authorization", issuer)
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Limit\":1,\"Marker\":\"" + marker + "\"}")
+                .when().post("/")
+                .then().statusCode(200);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ListKeys", "ListAliases"})
+    void listKeysAndAliasesRejectBadMarker(String action) {
+        given()
+                .header("X-Amz-Target", "TrentService." + action)
+                .contentType(KMS_CONTENT_TYPE)
+                .body("{\"Marker\":\"bad-marker\"}")
                 .when().post("/")
                 .then()
                 .statusCode(400)

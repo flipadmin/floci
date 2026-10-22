@@ -37,6 +37,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -275,9 +276,8 @@ public class DsqlEndpoint {
 
     /**
      * Whether {@code token} lets {@code user} in, checked in the order DSQL reports: the cluster
-     * the client asked for by name (or, without a name, the one the token is for), the action
-     * the user needs, the token's expiry, then its signature and, for a role other than
-     * {@code admin}, the IAM role mapped to it.
+     * the client named as its TLS server, the action the user needs, the token's expiry, then its
+     * signature and, for a role other than {@code admin}, the IAM role mapped to it.
      */
     Admission admit(String token, String user, String serverName) {
         URI uri;
@@ -293,8 +293,7 @@ public class DsqlEndpoint {
             return Admission.refused(null);
         }
         host = host.toLowerCase(Locale.ROOT);
-        String target = serverName == null ? host : serverName.toLowerCase(Locale.ROOT);
-        Route route = routes.get(target);
+        Route route = routes.get(serverName.toLowerCase(Locale.ROOT));
         if (route == null || !route.host().equals(host)) {
             return Admission.refused(null);
         }
@@ -362,26 +361,16 @@ public class DsqlEndpoint {
      * {@code Signature expired: <expiry> is now earlier than <now - 5 s> (<now> - 0 min.)}.
      */
     private static String expiredHint(String rawQuery) {
-        String date = SigV4RequestValidator.queryParameter(rawQuery, "X-Amz-Date");
-        String expires = SigV4RequestValidator.queryParameter(rawQuery, "X-Amz-Expires");
-        if (date == null || expires == null) {
-            return null;
-        }
-        Instant expiry;
-        try {
-            expiry = Instant.from(AMZ_DATE.parse(date)).plusSeconds(Long.parseLong(expires));
-        } catch (RuntimeException ignored) {
-            // A date or expiry that does not parse gets no hint here: the signature check that
-            // follows refuses the token without one, as DSQL does.
-            return null;
-        }
+        // A token without an expiry that parses gets no hint here: the signature check that
+        // follows refuses it without one, as DSQL does.
+        Optional<Instant> expiry = SigV4RequestValidator.expiry(rawQuery);
         Instant now = Instant.now();
         Instant earliest = now.minus(EXPIRY_GRACE);
-        if (!expiry.isBefore(earliest)) {
+        if (expiry.isEmpty() || !expiry.get().isBefore(earliest)) {
             return null;
         }
-        return "Signature expired: " + AMZ_DATE.format(expiry) + " is now earlier than " + AMZ_DATE.format(earliest)
-                + " (" + AMZ_DATE.format(now) + " - 0 min.)";
+        return "Signature expired: " + AMZ_DATE.format(expiry.get()) + " is now earlier than "
+                + AMZ_DATE.format(earliest) + " (" + AMZ_DATE.format(now) + " - 0 min.)";
     }
 
     /**

@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountCloneable;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.DeadlineCharSequence;
@@ -15,6 +16,7 @@ import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -45,7 +47,7 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 @ApplicationScoped
-public class SsmService implements ResourceProvider {
+public class SsmService implements ResourceProvider, AccountCloneable {
 
     private static final Logger LOG = Logger.getLogger(SsmService.class);
 
@@ -56,6 +58,7 @@ public class SsmService implements ResourceProvider {
     // Label is a ParameterStringFilter key too, but only GetParametersByPath accepts it.
     private static final Set<String> DESCRIBE_PARAMETERS_FILTER_KEYS =
             Set.of("Name", "Type", "KeyId", "Path", "Tier", "DataType");
+    private static final Set<String> GET_PARAMETERS_BY_PATH_FILTER_KEYS = Set.of("Type", "KeyId", "Label");
     private static final String DEFAULT_SSM_KEY_ID = "alias/aws/ssm";
     private static final int STANDARD_TIER_MAX_VALUE_BYTES = 4096;
     private static final Set<String> PARAMETER_TIERS = Set.of("Standard", "Advanced", "Intelligent-Tiering");
@@ -561,6 +564,15 @@ public class SsmService implements ResourceProvider {
         });
     }
 
+    public List<Parameter> getParametersByPath(String path, boolean recursive,
+                                              List<ParameterStringFilter> filters, String region) {
+        filters.forEach(SsmService::validateGetParametersByPathFilter);
+        List<ParameterStringFilter> matchingFilters = filters.stream().filter(filter -> !"Label".equals(filter.key())).toList();
+        return getParametersByPath(path, recursive, region).stream()
+                .filter(parameter -> matchingFilters.stream().allMatch(filter -> matchesParameterFilter(parameter, filter)))
+                .toList();
+    }
+
     public List<Parameter> getParametersByPath(String path, boolean recursive, String region) {
         String normalizedPath = path.endsWith("/") ? path : path + "/";
         String prefix = region + "::";
@@ -663,9 +675,7 @@ public class SsmService implements ResourceProvider {
                     : "Name".equals(key) ? Set.of("Equals", "BeginsWith", "Contains")
                     : Set.of("Equals", "BeginsWith");
             if (!options.contains(filter.option())) {
-                throw new AwsException("InvalidFilterOption",
-                        "The specified filter option isn't valid. Valid options are Equals and BeginsWith. "
-                                + "For Path filter, valid options are Recursive and OneLevel.", 400);
+                throw invalidFilterOption();
             }
         }
         // Every key but a tag needs at least one value, and a path value must be absolute.
@@ -675,6 +685,30 @@ public class SsmService implements ResourceProvider {
             throw new AwsException("InvalidFilterValue",
                     "The filter value isn't valid. Verify the value and try again.", 400);
         }
+    }
+
+    private static void validateGetParametersByPathFilter(ParameterStringFilter filter) {
+        String key = filter.key();
+        if (key == null || !GET_PARAMETERS_BY_PATH_FILTER_KEYS.contains(key)) {
+            throw new AwsException("InvalidFilterKey", "The specified key isn't valid.", 400);
+        }
+        if (!"Label".equals(key)) {
+            validateDescribeParametersFilter(filter);
+            return;
+        }
+        if (filter.option() != null && !"Equals".equals(filter.option())) {
+            throw invalidFilterOption();
+        }
+        if (filter.values().isEmpty()) {
+            throw new AwsException("InvalidFilterValue",
+                    "The filter value isn't valid. Verify the value and try again.", 400);
+        }
+    }
+
+    private static AwsException invalidFilterOption() {
+        return new AwsException("InvalidFilterOption",
+                "The specified filter option isn't valid. Valid options are Equals and BeginsWith. "
+                        + "For Path filter, valid options are Recursive and OneLevel.", 400);
     }
 
     private static boolean matchesParameterFilter(Parameter parameter, ParameterStringFilter filter) {
@@ -1525,6 +1559,38 @@ public class SsmService implements ResourceProvider {
 
     private static String regionKey(String region, String name) {
         return region + "::" + name;
+    }
+
+    // --- AccountCloneable ---
+    // parameterStore/historyStore are plain AccountAwareStorageBackend fields under the "ssm"
+    // service name, and, unlike SQS/SNS, the storage key here (region::name) never embeds the
+    // account ID, only the Parameter's own `arn` field does. So the generic storage-level clone
+    // already leaves each cloned parameter reachable at the right key; this only has to fix up
+    // the stale arn left pointing at the source account. No bypass fields exist, so clear needs
+    // no extra work beyond the generic pass.
+
+    @Override
+    public String serviceName() {
+        return "ssm";
+    }
+
+    @Override
+    public void cloneAccountData(String targetAccountId, String sourceAccountId) {
+        if (!(parameterStore instanceof AccountAwareStorageBackend<Parameter> aware)) {
+            return;
+        }
+        for (String rawKey : aware.keysForAccount(targetAccountId)) {
+            aware.getForAccount(targetAccountId, rawKey).ifPresent(parameter -> {
+                String region = rawKey.substring(0, rawKey.indexOf("::"));
+                parameter.setArn(AwsArnUtils.Arn.of("ssm", region, targetAccountId, parameterResource(parameter.getName())).toString());
+                aware.putForAccount(targetAccountId, rawKey, parameter);
+            });
+        }
+    }
+
+    @Override
+    public void clearAccountData(String accountId) {
+        // No bypass fields: the generic storage-level clear already covers parameterStore/historyStore.
     }
 
     private void addHistory(String storageKey, Parameter parameter) {

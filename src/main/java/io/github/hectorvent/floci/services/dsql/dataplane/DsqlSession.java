@@ -43,9 +43,14 @@ import java.util.stream.Stream;
 final class DsqlSession {
 
     static final Duration CONNECTION_LIFETIME = Duration.ofHours(1);
-    // A startup packet is refused above PostgreSQL's own limit, 10,000 bytes, and a message above 64 MB.
-    private static final int MAX_STARTUP = 10_000;
-    private static final int MAX_MESSAGE = 64 * 1024 * 1024;
+    // DSQL's (measured): a startup packet of 10,000 bytes or more, and a client message over 10 MiB,
+    // are refused with a FATAL before the connection closes. What the database sends is not DSQL's
+    // limit to apply, and is read up to 64 MB.
+    private static final int MAX_STARTUP = 9_999;
+    private static final int MAX_CLIENT_MESSAGE = 10 * 1024 * 1024;
+    private static final int MAX_DATABASE_MESSAGE = 64 * 1024 * 1024;
+    private static final String INVALID_STARTUP_LENGTH = "invalid length of startup packet";
+    private static final String INVALID_MESSAGE_LENGTH = "invalid message length";
     private static final String SERIALIZATION_FAILURE = "40001";
     private static final String QUERY_CANCELED = "57014";
     private static final String ACCESS_DENIED = "unable to accept connection, access denied";
@@ -103,7 +108,7 @@ final class DsqlSession {
         socket.setSoTimeout(endpoint.handshakeTimeoutMillis());
         InputStream rawIn = socket.getInputStream();
         OutputStream rawOut = socket.getOutputStream();
-        PostgresWire.Startup first = PostgresWire.readStartup(rawIn, MAX_STARTUP, "startup message");
+        PostgresWire.Startup first = readPlaintextPacket(rawIn);
         if (first.code() == PostgresWire.CANCEL_REQUEST) {
             endpoint.forwardCancel(first.body());
             return;
@@ -111,7 +116,7 @@ final class DsqlSession {
         if (first.code() == PostgresWire.GSSENC_REQUEST) {
             rawOut.write('N');
             rawOut.flush();
-            first = PostgresWire.readStartup(rawIn, MAX_STARTUP, "startup message");
+            first = readPlaintextPacket(rawIn);
         }
         if (first.code() != PostgresWire.SSL_REQUEST) {
             refuse(rawOut, "08P01", "unable to accept connection, SSL is mandatory. AWS Authentication is required.",
@@ -139,7 +144,13 @@ final class DsqlSession {
 
         InputStream in = new BufferedInputStream(tls.getInputStream());
         OutputStream out = new BufferedOutputStream(tls.getOutputStream());
-        PostgresWire.Startup startup = PostgresWire.readStartup(in, MAX_STARTUP, "startup message");
+        PostgresWire.Startup startup;
+        try {
+            startup = PostgresWire.readStartup(in, MAX_STARTUP, "startup message");
+        } catch (PostgresWire.InvalidLengthException e) {
+            refuse(out, "08P01", INVALID_STARTUP_LENGTH, null);
+            return;
+        }
         if (startup.code() == PostgresWire.CANCEL_REQUEST) {
             endpoint.forwardCancel(startup.body());
             return;
@@ -154,9 +165,21 @@ final class DsqlSession {
 
         PostgresWire.write(out, (byte) 'R', PostgresWire.int32(3));
         out.flush();
-        PostgresWire.Message password = PostgresWire.read(in, MAX_MESSAGE, "message");
+        PostgresWire.Message password;
+        try {
+            password = PostgresWire.read(in, MAX_CLIENT_MESSAGE, "message");
+        } catch (PostgresWire.InvalidLengthException e) {
+            refuse(out, "08P01", INVALID_MESSAGE_LENGTH, null);
+            return;
+        }
         if (password.type() != 'p') {
             refuse(out, "08006", ACCESS_DENIED, null);
+            return;
+        }
+        if (serverName[0] == null) {
+            // DSQL knows the cluster only by the TLS server name, and refuses a connection that sends
+            // none once its password is in, whatever the password (measured).
+            refuse(out, "08P01", "unable to accept connection, sni was not received", null);
             return;
         }
         String token = PostgresWire.cString(password.body(), 0).value();
@@ -228,7 +251,13 @@ final class DsqlSession {
 
     private void relayToBackend(InputStream in, OutputStream backendOut) throws IOException {
         while (true) {
-            PostgresWire.Message message = PostgresWire.read(in, MAX_MESSAGE, "message");
+            PostgresWire.Message message;
+            try {
+                message = PostgresWire.read(in, MAX_CLIENT_MESSAGE, "message");
+            } catch (PostgresWire.InvalidLengthException e) {
+                close("FATAL", "08P01", INVALID_MESSAGE_LENGTH, "Session Id: " + sessionId);
+                return;
+            }
             if (message.type() != 'X') {
                 lastClientMessage = now();
                 if (transactionStatus == 'T' && pastAgeLimit()) {
@@ -579,7 +608,7 @@ final class DsqlSession {
             List<PostgresWire.Message> startup = new ArrayList<>();
             boolean started = false;
             while (true) {
-                PostgresWire.Message message = PostgresWire.read(backendIn, MAX_MESSAGE, "message");
+                PostgresWire.Message message = PostgresWire.read(backendIn, MAX_DATABASE_MESSAGE, "message");
                 if (!started) {
                     // DSQL refuses a connection instead of authenticating it, so what the database
                     // answers the startup waits for its ReadyForQuery, and a refusal takes its place.
@@ -747,6 +776,23 @@ final class DsqlSession {
         Map<Character, String> fields = PostgresWire.parseFields(body, 0);
         fields.putIfAbsent('D', "Session Id: " + sessionId);
         return PostgresWire.fields(fields);
+    }
+
+    /**
+     * A packet sent before TLS. DSQL refuses one that is no SSLRequest, GSSENCRequest or
+     * CancelRequest as not TLS whatever length it claims, and ends the connection without a word on
+     * one under 8 bytes (measured). So a length past what a startup packet may hold is refused with
+     * its body left unread; a shorter body is read, so the refusal reaches the client in order.
+     */
+    private static PostgresWire.Startup readPlaintextPacket(InputStream in) throws IOException {
+        int length = PostgresWire.checkedLength(PostgresWire.readInt32(in), 8, Integer.MAX_VALUE, "startup message");
+        int code = PostgresWire.readInt32(in);
+        if (length > MAX_STARTUP) {
+            return new PostgresWire.Startup(code, new byte[0]);
+        }
+        byte[] body = new byte[length - 8];
+        PostgresWire.readFully(in, body);
+        return new PostgresWire.Startup(code, body);
     }
 
     /** An ErrorResponse body of {@code severity} (FATAL, ERROR), as DSQL orders its fields. */
