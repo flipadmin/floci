@@ -16,6 +16,7 @@ import static org.hamcrest.Matchers.endsWith;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 /**
  * End-to-end coverage for the test-isolation clone/clear admin API: clone a baseline account's
@@ -239,6 +240,29 @@ class AccountLifecycleControllerTest {
         .when().post("/").then()
             .statusCode(200)
             .body(containsString("<Value>1</Value>"));
+
+        clear(TARGET_ACCOUNT, "sqs");
+    }
+
+    @Test
+    void clearDropsTheTargetsSqsMessagesAndDeduplicationSoItStartsClean() {
+        String queueName = "clear-lifecycle-dedup.fifo";
+        createFifoQueue(SOURCE_ACCOUNT, queueName);
+        sendFifo(SOURCE_ACCOUNT, queueName, "baseline", "baseline-dedup");
+        clone(TARGET_ACCOUNT, SOURCE_ACCOUNT, "sqs");
+        String targetOnlyMessageId = sendFifo(TARGET_ACCOUNT, queueName, "target-only", "target-dedup");
+
+        clear(TARGET_ACCOUNT, "sqs");
+
+        createFifoQueue(TARGET_ACCOUNT, queueName);
+        assertEquals("0", approximateNumberOfMessages(TARGET_ACCOUNT, queueName));
+        assertNotEquals(targetOnlyMessageId, sendFifo(TARGET_ACCOUNT, queueName, "after-clear", "target-dedup"),
+                "a deduplication ID used before the clear must be accepted as a new message");
+        assertEquals("1", approximateNumberOfMessages(TARGET_ACCOUNT, queueName));
+
+        clone(TARGET_ACCOUNT, SOURCE_ACCOUNT, "sqs");
+        assertEquals("1", approximateNumberOfMessages(TARGET_ACCOUNT, queueName),
+                "a re-clone holds exactly the source's messages");
 
         clear(TARGET_ACCOUNT, "sqs");
     }
@@ -649,6 +673,10 @@ class AccountLifecycleControllerTest {
     }
 
     private static String sendFifo(String accountId, String queueName, String body) {
+        return sendFifo(accountId, queueName, body, "dedup-1");
+    }
+
+    private static String sendFifo(String accountId, String queueName, String body, String deduplicationId) {
         return given()
             .header("Authorization", auth("sqs", accountId))
             .contentType("application/x-www-form-urlencoded")
@@ -656,10 +684,33 @@ class AccountLifecycleControllerTest {
             .formParam("QueueUrl", "http://localhost:8081/" + accountId + "/" + queueName)
             .formParam("MessageBody", body)
             .formParam("MessageGroupId", "group")
-            .formParam("MessageDeduplicationId", "dedup-1")
+            .formParam("MessageDeduplicationId", deduplicationId)
         .when().post("/").then()
             .statusCode(200)
             .extract().xmlPath().getString("SendMessageResponse.SendMessageResult.MessageId");
+    }
+
+    private static void createFifoQueue(String accountId, String queueName) {
+        given()
+            .header("Authorization", auth("sqs", accountId))
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", queueName)
+            .formParam("Attribute.1.Name", "FifoQueue")
+            .formParam("Attribute.1.Value", "true")
+        .when().post("/").then().statusCode(200);
+    }
+
+    private static String approximateNumberOfMessages(String accountId, String queueName) {
+        return given()
+            .header("Authorization", auth("sqs", accountId))
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetQueueAttributes")
+            .formParam("QueueUrl", "http://localhost:8081/" + accountId + "/" + queueName)
+            .formParam("AttributeName.1", "ApproximateNumberOfMessages")
+        .when().post("/").then()
+            .statusCode(200)
+            .extract().xmlPath().getString("GetQueueAttributesResponse.GetQueueAttributesResult.Attribute.Value");
     }
 
     private static String jsonArray(String[] values) {
