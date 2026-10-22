@@ -483,6 +483,23 @@ class AccountLifecycleControllerTest {
     }
 
     @Test
+    void cloneRejectsTheSourceAsItsOwnTargetWithoutTouchingIt() {
+        String tableName = "self-clone-table";
+        ddb(SOURCE_ACCOUNT, "CreateTable", simpleTableBody(tableName)).statusCode(200);
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"source": "%s", "services": ["dynamodb"]}
+                """.formatted(SOURCE_ACCOUNT))
+        .when().post("/_floci/accounts/" + SOURCE_ACCOUNT + "/clone")
+        .then().statusCode(400);
+
+        ddb(SOURCE_ACCOUNT, "DescribeTable", "{\"TableName\": \"%s\"}".formatted(tableName))
+            .statusCode(200);
+    }
+
+    @Test
     void cloneRejectsAMissingSource() {
         given()
             .contentType("application/json")

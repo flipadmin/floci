@@ -40,6 +40,9 @@ public class AccountLifecycleController {
         if (request == null || request.source() == null || request.source().isBlank()) {
             return badRequest("source is required");
         }
+        if (request.source().equals(accountId)) {
+            return badRequest("source and target must be different accounts");
+        }
         try {
             accountLifecycleService.cloneAccount(accountId, request.source(), request.services());
         } catch (IllegalArgumentException e) {
