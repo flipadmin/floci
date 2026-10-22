@@ -12,6 +12,7 @@ import jakarta.ws.rs.core.Response;
 
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /**
  * Admin surface for the test-isolation clone/clear feature: give each test its own throwaway
@@ -22,6 +23,10 @@ import java.util.Map;
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class AccountLifecycleController {
+
+    // The account ID becomes a storage key prefix and an S3 directory name, so nothing but a
+    // 12-digit ID may reach the services.
+    private static final Pattern ACCOUNT_ID = Pattern.compile("\\d{12}");
 
     private final AccountLifecycleService accountLifecycleService;
 
@@ -37,8 +42,14 @@ public class AccountLifecycleController {
     @POST
     @Path("/accounts/{accountId}/clone")
     public Response clone(@PathParam("accountId") String accountId, CloneRequest request) {
+        if (!isAccountId(accountId)) {
+            return invalidAccountId("target");
+        }
         if (request == null || request.source() == null || request.source().isBlank()) {
             return badRequest("source is required");
+        }
+        if (!isAccountId(request.source())) {
+            return invalidAccountId("source");
         }
         if (request.source().equals(accountId)) {
             return badRequest("source and target must be different accounts");
@@ -54,12 +65,23 @@ public class AccountLifecycleController {
     @POST
     @Path("/accounts/{accountId}/clear")
     public Response clear(@PathParam("accountId") String accountId, ClearRequest request) {
+        if (!isAccountId(accountId)) {
+            return invalidAccountId("target");
+        }
         try {
             accountLifecycleService.clearAccount(accountId, request == null ? null : request.services());
         } catch (IllegalArgumentException e) {
             return badRequest(e.getMessage());
         }
         return Response.ok(Map.of("status", "OK")).build();
+    }
+
+    private static boolean isAccountId(String value) {
+        return ACCOUNT_ID.matcher(value).matches();
+    }
+
+    private Response invalidAccountId(String role) {
+        return badRequest(role + " must be a 12-digit account ID");
     }
 
     private Response badRequest(String message) {

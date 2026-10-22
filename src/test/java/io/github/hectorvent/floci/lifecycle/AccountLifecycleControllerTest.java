@@ -500,6 +500,45 @@ class AccountLifecycleControllerTest {
     }
 
     @Test
+    void cloneRejectsATargetThatIsNotA12DigitAccountId() {
+        for (String target : List.of("00000000002", "0000000000020", "not-an-account")) {
+            given()
+                .contentType("application/json")
+                .body("""
+                    {"source": "%s", "services": ["s3"]}
+                    """.formatted(SOURCE_ACCOUNT))
+            .when().post("/_floci/accounts/" + target + "/clone")
+            .then().statusCode(400);
+        }
+    }
+
+    @Test
+    void cloneRejectsASourceThatIsNotA12DigitAccountId() {
+        for (String source : List.of("../" + SOURCE_ACCOUNT, "00000000001", SOURCE_ACCOUNT + "/..")) {
+            given()
+                .contentType("application/json")
+                .body("""
+                    {"source": "%s", "services": ["s3"]}
+                    """.formatted(source))
+            .when().post("/_floci/accounts/" + TARGET_ACCOUNT + "/clone")
+            .then().statusCode(400);
+        }
+    }
+
+    @Test
+    void clearRejectsAnAccountThatIsNotA12DigitAccountId() {
+        for (String target : List.of("00000000002", "not-an-account")) {
+            given()
+                .contentType("application/json")
+                .body("""
+                    {"services": ["s3"]}
+                    """)
+            .when().post("/_floci/accounts/" + target + "/clear")
+            .then().statusCode(400);
+        }
+    }
+
+    @Test
     void cloneRejectsAMissingSource() {
         given()
             .contentType("application/json")
