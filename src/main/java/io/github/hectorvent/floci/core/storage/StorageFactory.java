@@ -171,11 +171,6 @@ public class StorageFactory {
         }
     }
 
-    /** Service names with a storage-backed clone/clear target, i.e. every name ever passed to {@link #create}. */
-    public synchronized Set<String> knownServiceNames() {
-        return backendsByService.keySet();
-    }
-
     /**
      * Clones {@code sourceAccountId}'s data into {@code targetAccountId} for each requested service,
      * across every backend registered under that service name.
